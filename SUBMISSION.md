@@ -7,18 +7,50 @@
 
 ---
 
-## Method (one paragraph)
+## Method
 
-A multi-restart placer that warm-starts from the contest's `initial.plc`, polishes
-each candidate with coordinate descent (CD) and large-neighborhood search (LNS),
-and escapes local minima with a Hessian-based saddle escape — a deterministic
-move along the most-negative-curvature direction of the proxy cost, computed by
-combining a block-diagonal eigen-decomposition with a Lanczos
-Rayleigh–Ritz refinement. Candidates are legalized through a tiered repair stack
-(local repair → minimum-disturbance → shelf-pack fallback) and selected by
-`(overlap_count, proxy_cost)` so legality strictly precedes score. The result is
-a fully open-source, GPU-free placer that produces zero-overlap legal placements
-on every IBM benchmark and a substantial proxy-cost improvement over the
+The placer is a parallel multi-restart search built around a calibrated fast
+proxy and a strict legality gate. Each call to `CDLNSPlacer.place(benchmark)`
+runs the following pipeline:
+
+1. **Warm-start.** All restarts begin from the contest's `initial.plc`. The
+   legalized initial layout is also retained as an "initial guard" candidate
+   so the placer never returns worse than the contest's hand-crafted seed.
+2. **Four parallel restarts.** A `ProcessPoolExecutor` launches four workers
+   with the mode mix `(conservative, light, aggressive, aggressive)` — varying
+   the warm-start σ, CD radius, sweep cap, and whether LNS runs at all — so
+   the search covers different basins instead of stacking redundant runs.
+3. **CD ↔ LNS inner loop.** Each restart alternates coordinate descent
+   (multi-scale, shrinking radius) with large-neighborhood-search
+   destroy-and-rebuild. LNS is **Hessian-guided**: a block-diagonal
+   approximation of the proxy Hessian ranks macros by their local
+   negative-curvature ("saddle-like") score, and the top-ranked macros seed
+   the destroy set, biasing search toward genuinely stuck regions instead of
+   random subsets.
+4. **Legalize every candidate.** A tiered overlap-repair stack (local
+   pair-pushing → minimum-disturbance reshuffle → shelf-pack fallback)
+   produces a fully legal placement for each restart output. Candidates are
+   sorted by `(overlap_count, proxy_cost)` using the official
+   `compute_proxy_cost`, so any zero-overlap placement beats every
+   overlap-positive one regardless of score.
+5. **Top-K final polish.** Within a bounded tail budget (~480 s), the top
+   `K = 8` legal candidates are refined by a small-radius CD polish that
+   operates on the already-legal placements and is re-scored with the
+   official proxy.
+6. **Hessian saddle escape.** The proxy-best candidate then undergoes a
+   deterministic saddle escape: a block-diagonal eigendecomposition (refined
+   by a Lanczos Rayleigh–Ritz pass) finds the most-negative-curvature
+   direction of the proxy cost, and a small line search along ±that direction
+   accepts only on strict improvement.
+7. **ORFS protection.** A spacing polish enforces ≥ 12 μm clearance and a
+   guard-repair pass keeps macros inside the core, giving Tier-2 OpenROAD
+   placements a clean starting point without compromising Tier-1 proxy.
+8. **Final selection.** Candidates are tied within 0.1 % proxy and broken by
+   ORFS-aware metrics, then the legalized positions of the winning candidate
+   are returned to the harness.
+
+The result is a fully open-source, GPU-free placer that returns zero-overlap
+legal placements on every IBM benchmark and substantially improves on the
 RePlAce baseline.
 
 ## Performance
