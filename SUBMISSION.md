@@ -59,18 +59,41 @@ RePlAce baseline.
 
 | Metric | Value |
 |---|---|
-| **Average proxy cost** | **1.1262** |
+| **Average proxy cost** | **1.1083** |
 | RePlAce baseline | 1.4578 |
 | SA baseline | 2.1251 |
-| Improvement vs RePlAce | **~22.7%** |
-| Average runtime / bench | 16.8 min (Apple M3 reference) |
-| Max runtime / bench | 37.3 min (ibm17) |
+| Improvement vs RePlAce | **24.0%** |
+| Improvement vs SA | 47.8% |
+| Average runtime / bench | 25.9 min (Apple M3 reference) |
+| Max runtime / bench | 37.7 min (ibm17) |
 | Contest runtime cap | 60 min / bench |
+| Total wall time | 443.9 min (7h 24m) |
 | Overlaps | **0 / 17** |
 
-Source: `output/17bench_final/` (`time_budget_s=1800`, `num_restarts=4`).
-A confirmation run at the placer's default `time_budget_s=3000` is in progress
-and will refresh these numbers before final form submission.
+Source: `output/final_submission/` (`time_budget_s=3000`, `num_restarts=4`).
+
+#### Per-benchmark breakdown
+
+| Bench | Proxy | Wirelen | Density | Congestion | Runtime | Overlaps |
+|---|---:|---:|---:|---:|---:|---:|
+| ibm01 | 0.8123 | 0.07 | 0.57 | 0.92 | 19.4 min | 0 |
+| ibm02 | 1.0988 | 0.08 | 0.65 | 1.39 | 23.3 min | 0 |
+| ibm03 | 0.9906 | 0.08 | 0.54 | 1.27 | 22.8 min | 0 |
+| ibm04 | 1.0209 | 0.07 | 0.60 | 1.29 | 22.6 min | 0 |
+| ibm06 | 1.1642 | 0.07 | 0.61 | 1.58 | 19.8 min | 0 |
+| ibm07 | 1.1235 | 0.07 | 0.63 | 1.47 | 23.8 min | 0 |
+| ibm08 | 1.1306 | 0.08 | 0.65 | 1.45 | 24.7 min | 0 |
+| ibm09 | 0.8465 | 0.06 | 0.61 | 0.96 | 22.3 min | 0 |
+| ibm10 | 1.1770 | 0.07 | 0.67 | 1.55 | 30.8 min | 0 |
+| ibm11 | 0.8804 | 0.06 | 0.58 | 1.07 | 22.7 min | 0 |
+| ibm12 | 1.3293 | 0.06 | 0.65 | 1.88 | 29.8 min | 0 |
+| ibm13 | 0.9959 | 0.07 | 0.66 | 1.20 | 23.7 min | 0 |
+| ibm14 | 1.2000 | 0.06 | 0.65 | 1.63 | 34.9 min | 0 |
+| ibm15 | 1.1826 | 0.06 | 0.65 | 1.59 | 25.6 min | 0 |
+| ibm16 | 1.2003 | 0.05 | 0.65 | 1.65 | 29.6 min | 0 |
+| ibm17 | 1.3687 | 0.06 | 0.67 | 1.95 | 37.7 min | 0 |
+| ibm18 | 1.3191 | 0.07 | 0.71 | 1.79 | 26.3 min | 0 |
+| **AVG** | **1.1083** | 0.067 | 0.633 | 1.451 | 25.9 min | **0** |
 
 ### Tier 2 — NG45 OpenROAD flow (ariane133)
 
