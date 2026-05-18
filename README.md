@@ -1,4 +1,16 @@
-# Partcl/HRT Macro Placement Challenge
+# K2HAL — Partcl × HRT Macro Placement Challenge 2026 Submission
+
+> **For judges:** This repo is K2HAL's submission. The submission summary,
+> method description, performance numbers, and reproduction steps live in
+> **[`SUBMISSION.md`](SUBMISSION.md)**. The entry-point placer is
+> [`submissions/macro_placer/cd_lns_placer.py`](submissions/macro_placer/cd_lns_placer.py).
+> Tags: [`v1.0-submission`](https://github.com/kc5587/K2HAL-macro-place-challenge/releases/tag/v1.0-submission)
+> (Tier 1 numbers of record) and
+> [`v1.1-submission`](https://github.com/kc5587/K2HAL-macro-place-challenge/releases/tag/v1.1-submission)
+> (ORFS-routable; tracks `main`). The rest of this README is the contest's
+> upstream description, preserved verbatim.
+
+---
 
 <img src="assets/HRT.png" alt="Hudson River Trading" height="80"> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <img src="assets/partcl.png" alt="Partcl" height="80">
 

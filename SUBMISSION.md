@@ -1,8 +1,11 @@
 # K2HAL — Macro Placement Challenge 2026 Submission
 
 **Team:** K2HAL · Kaushal Chitturu ([kc5587](https://github.com/kc5587))
-**Method:** CD-LNS with Hessian Saddle Escape
-**Tag:** [`v1.0-submission`](https://github.com/kc5587/K2HAL-macro-place-challenge/releases/tag/v1.0-submission) (commit `69a7673`)
+**Method:** Parallel CD + Hessian-Guided LNS + Top-K Polish + Saddle Escape
+**Tags:**
+- [`v1.0-submission`](https://github.com/kc5587/K2HAL-macro-place-challenge/releases/tag/v1.0-submission) — original placer that produced the locked **Tier 1 numbers (avg proxy 1.1083)**. Crashes ORFS PDN on NG45; kept as the Tier-1-numbers-of-record snapshot.
+- [`v1.1-submission`](https://github.com/kc5587/K2HAL-macro-place-challenge/releases/tag/v1.1-submission) — adds PDN-aware spacing polish, 5 nm manufacturing-grid snap, and spatial-window LNS destroy. Same Tier 1 behavior (ibm01 bit-identical), **full ORFS flow passes end-to-end** on NG45 ariane133 (WNS 0.258871 ns, Core Area 4,306,330 μm²). `main` branch tracks this.
+
 **License:** Apache 2.0 (see [LICENSE.md](LICENSE.md))
 
 ---
@@ -42,9 +45,15 @@ runs the following pipeline:
    by a Lanczos Rayleigh–Ritz pass) finds the most-negative-curvature
    direction of the proxy cost, and a small line search along ±that direction
    accepts only on strict improvement.
-7. **ORFS protection.** A spacing polish enforces ≥ 12 μm clearance and a
-   guard-repair pass keeps macros inside the core, giving Tier-2 OpenROAD
-   placements a clean starting point without compromising Tier-1 proxy.
+7. **ORFS protection.** A narrow-channel-aware spacing polish enforces a
+   ≥ 20 μm gap between macro pairs that would otherwise form sub-PDN-pitch
+   channels (NG45 metal4 needs ≥ ~14 μm to fit a strap + 2 μm halos), and a
+   guard-repair pass keeps macros inside the core. Positions are also
+   snapped to the 5 nm manufacturing grid when the ORFS macro-placement
+   TCL is written, preventing DRT-0416 off-grid pin-shape errors during
+   global routing. Together these give Tier-2 OpenROAD placements a clean
+   starting point without compromising Tier-1 proxy (ibm01 is bit-identical
+   to v1.0).
 8. **Final selection.** Candidates are tied within 0.1 % proxy and broken by
    ORFS-aware metrics, then the legalized positions of the winning candidate
    are returned to the harness.
@@ -151,10 +160,12 @@ submodule.
 | `submissions/macro_placer/_audit.py` | Self-containment guard run at import time |
 | `macro_place/cd.py` | Coordinate descent inner loop |
 | `macro_place/lns_v2.py` | Large-neighborhood search rebuild |
+| `macro_place/spatial_lns.py` | Spatial-window destroy-seed generator (picks macros in the densest grid cell) |
 | `macro_place/hessian_escape.py` | Block-diagonal + Lanczos Rayleigh–Ritz saddle escape |
 | `macro_place/legality.py` | Tiered overlap-repair stack including shelf-pack fallback |
 | `macro_place/fast_proxy.py` | Calibrated fast proxy used during search (1800× speedup vs `compute_proxy_cost`, <1 ppm error) |
-| `tests/` | Unit and integration tests |
+| `scripts/generate_macro_placement_tcl.py` | Writes ORFS macro-placement TCL with positions snapped to the 5 nm NG45 manufacturing grid |
+| `tests/` | Unit and integration tests (40+ tests including `test_spatial_lns.py`) |
 
 ## Compliance
 
@@ -166,7 +177,8 @@ submodule.
 | No benchmark-specific hardcoding | ✓ Generic algorithm, identical config across all 17 IBM benches |
 | No external proprietary tools | ✓ Pure Python / NumPy / PyTorch / Numba |
 | Zero overlaps | ✓ Strict gate enforced |
-| ≤ 1 h runtime per benchmark | ✓ Max 37.3 min observed |
+| ≤ 1 h runtime per benchmark | ✓ Max 37.7 min observed (ibm17) |
+| ORFS PDN + DRT pass | ✓ Verified end-to-end on NG45 ariane133 (v1.1) |
 
 ## Contact
 
