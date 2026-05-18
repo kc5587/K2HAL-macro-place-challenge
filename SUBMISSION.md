@@ -89,19 +89,6 @@ submodule.
 | `macro_place/fast_proxy.py` | Calibrated fast proxy used during search (1800× speedup vs `compute_proxy_cost`, <1 ppm error) |
 | `tests/` | Unit and integration tests |
 
-## Technical highlight — Hessian Saddle Escape
-
-The novel contribution worth noting for the Innovation Award is the
-Hessian-guided saddle escape. After CD converges, we form a sparse approximation
-of the proxy-cost Hessian, take the eigenvector of its smallest eigenvalue (via
-a fast block-diagonal eigendecomposition, then refined with a Lanczos
-Rayleigh–Ritz pass), and perform a 1-D line search along ±that direction. When
-the smallest eigenvalue is negative — which empirically happens on most
-benchmarks once CD stalls — this provably exits the local minimum into a lower
-basin. The escape is deterministic (no random perturbation), bounded by a
-single eigen-solve per restart, and only accepted when the new placement
-strictly improves the official proxy cost.
-
 ## Compliance
 
 | Rule | Status |
