@@ -18,6 +18,23 @@ from pathlib import Path
 from macro_place.loader import load_benchmark_from_dir
 
 
+# NG45 manufacturing grid: 10 DB units at 2000 DB/μm = 5 nm = 0.005 μm.
+# DRT-0416 fires on globalroute when a pin shape (macro_position + pin_offset)
+# is not a multiple of the manufacturing grid. Snapping macro positions to
+# the grid here keeps the rest of the placer's float math unchanged while
+# producing ORFS-routable TCL output. Observed regression on ariane133
+# 2026-05-18 where placer-output 998.869202 μm × 2000 = 1997738.4 DB units →
+# truncated to 1997738 → mod 10 = 8 → off-grid → DRT-0416 crash.
+_MANUFACTURING_GRID_UM = 0.005
+
+
+def _snap_to_grid(value: float, grid: float = _MANUFACTURING_GRID_UM) -> float:
+    """Round ``value`` (in μm) to the nearest multiple of ``grid``."""
+    if grid <= 0.0:
+        return float(value)
+    return round(float(value) / grid) * grid
+
+
 def generate_random_placement(benchmark, seed=42):
     """Generate random placement for demo."""
     torch.manual_seed(seed)
@@ -81,8 +98,8 @@ def write_openroad_placement_tcl(placement, benchmark, plc, output_file):
 
             # place_macro uses lower-left corner, not center
             # So convert from center to lower-left
-            x_ll = x - w / 2
-            y_ll = y - h / 2
+            x_ll = _snap_to_grid(x - w / 2)
+            y_ll = _snap_to_grid(y - h / 2)
 
             # Get orientation
             orientation = node.get_orientation() if node.get_orientation() else "R0"
@@ -382,6 +399,8 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
         for group_prefix in sorted(group_data.keys()):
             for k in sorted(group_data[group_prefix].keys()):
                 x_ll, y_ll, orient, plc_name = group_data[group_prefix][k]
+                x_ll = _snap_to_grid(x_ll)
+                y_ll = _snap_to_grid(y_ll)
                 # Tcl curly braces ({}) prevent command substitution; required
                 # because plc_name contains brackets like sram_block[0] which
                 # Tcl would otherwise try to evaluate as `[0]` command.
@@ -390,6 +409,8 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
         f.write("# Direct placement data: exact ODB instance name -> {x y orient plc_name}\n")
         f.write("set _direct [dict create]\n")
         for odb_name, x_ll, y_ll, _w, _h, orient, plc_name in direct_data:
+            x_ll = _snap_to_grid(x_ll)
+            y_ll = _snap_to_grid(y_ll)
             f.write(
                 # Use Tcl curly braces ({}) for the key + plc_name so brackets
                 # like sram_block[0] aren't treated as Tcl command substitution.

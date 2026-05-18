@@ -22,6 +22,7 @@ _REQUIRED = (
     "macro_place.cd",
     "macro_place.lns_v2",
     "macro_place.hessian_escape",
+    "macro_place.spatial_lns",
 )
 
 
