@@ -8,6 +8,7 @@ rescored with the official TILOS evaluator.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,20 @@ from macro_place.fast_proxy import build_fast_proxy_context, fast_proxy
 from macro_place.legality import repair_overlaps
 from macro_place.lns_v2 import lns_destroy_rebuild
 from macro_place.objective import compute_proxy_cost
+from macro_place.sa_generator import (
+    generate_sa_candidates,
+    generate_targeted_sa_escape_candidates,
+)
 from macro_place.hessian_escape import block_diag_top_saddle_macros, hessian_escape
+from macro_place.congestion_destroy import worst_congestion_bin_destroy_seeds
+from macro_place.hybrid_target import hybrid_target_hard_macros
+from macro_place.restart_modes import mode_params
+from macro_place.adaptive_config import (
+    extract_bench_metrics,
+    adaptive_overrides_from_metrics,
+)
+from macro_place.orientation import build_orientation_state
+from macro_place.rotation_polish import polish_orientations_fast
 from macro_place.spatial_lns import spatial_window_destroy_seeds
 
 
@@ -55,6 +69,50 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "lns_min_time_budget_s": 5.0,
     "warm_start_sigma": 0.05,
     "restart_modes": ("conservative", "light", "aggressive", "aggressive"),
+    # Experimental basin generator. Disabled until a smoke/full-budget probe
+    # proves it beats the D-enabled CD/LNS baseline under equal work.
+    "sa_generator_enabled": False,
+    "sa_generator_steps": 1_000,
+    "sa_generator_num_candidates": 4,
+    "sa_generator_seed": 20_000,
+    "sa_generator_initial_temperature_ratio": 0.03,
+    "sa_generator_final_temperature_ratio": 0.001,
+    "sa_generator_global_move_probability": 0.70,
+    "sa_generator_overlap_penalty": 0.02,
+    "sa_generator_diversity_distance_ratio": 0.03,
+    "sa_generator_exact_rescore_pool_size": 64,
+    "sa_generator_pre_legalize_iters": 0,
+    "targeted_sa_escape_enabled": False,
+    "targeted_sa_escape_steps": 1_000,
+    "targeted_sa_escape_num_candidates": 4,
+    "targeted_sa_escape_seed": 30_000,
+    "targeted_sa_escape_target_count": 16,
+    "targeted_sa_escape_top_n_bins": 8,
+    "targeted_sa_escape_macros_per_bin": 4,
+    "targeted_sa_escape_exact_rescore_pool_size": 32,
+    "targeted_sa_escape_polish_time_budget_s": 0.0,
+    # Lever 2 (multi-source targeted SA). Default 1 = single source (current
+    # behavior — SA seeds from proxy-best only). >1 runs SA from top-N
+    # candidates by key; final selection unchanged.
+    "targeted_sa_source_top_k": 1,
+    # Lever 3 (hybrid target macro scoring). "congestion" (default) preserves
+    # current selection (worst_congestion_bin_destroy_seeds). "hybrid" uses
+    # hybrid_target_hard_macros combining congestion + area + degree + crowding.
+    "targeted_sa_target_strategy": "congestion",
+    # Lever 4 (adaptive SA temperature). "static" (default) preserves the
+    # current schedule (initial_temperature_ratio=0.01). "adaptive" samples
+    # ``adaptive_num_trials`` random moves before SA, computes the median
+    # positive proxy delta, and sets T0 to make P(accept) = adaptive_target_accept.
+    "targeted_sa_temperature_mode": "static",
+    "targeted_sa_adaptive_num_trials": 64,
+    "targeted_sa_adaptive_target_accept": 0.5,
+    # Lever 6 (runtime-aware gating). Both default no-op:
+    # - min_remaining_budget_s == 0.0: never skip targeted-SA on time.
+    # - max_proxy_regression_to_polish == math.inf: always polish candidates.
+    "targeted_sa_min_remaining_budget_s": 0.0,
+    "targeted_sa_max_proxy_regression_to_polish": math.inf,
+    "cd_congestion_tiebreak_enabled": False,
+    "cd_congestion_tiebreak_epsilon": 1e-3,
     "topk_polish_enabled": True,
     # Tier-1 lever (polish-every-restart): was 2; bumped to 8 so the
     # polish stage runs on ALL candidates up to that many. With
@@ -94,6 +152,10 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # Rayleigh-Ritz. Designed to find coupled-macro saddles invisible to
     # single-macro CD. Plan + Bet-6 failure analysis in
     # docs/superpowers/plans/2026-05-16-hessian-saddle-escape-plan.md.
+    # Lever 5 (hessian on top-K). Default 1 = current behavior (hessian runs
+    # only on proxy-best candidate). When >1, sort candidates by key and run
+    # hessian on each top-K; all strict-improvements join the candidate pool.
+    "hessian_escape_top_k": 1,
     "hessian_escape_enabled": True,             # ON — ibm06 probe confirmed 0.18% win
     "hessian_escape_h_block": 0.5,              # FD step for block-diag, canvas units
     "hessian_escape_h_lanczos": 0.1,            # FD step for Lanczos quadratic form
@@ -121,9 +183,123 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "spatial_window_destroy_enabled": True,
     "spatial_window_grid_size": 16,
     "spatial_window_share": 0.5,  # fraction of num_destroy that comes from spatial seeds
+    # Lever L (worst-congestion-bin destroy). EDA showed congestion is 65.5%
+    # of proxy on avg across 17 IBM benches; existing destroy sources do not
+    # target it. Picks macros NEAREST to top congestion bins.
+    # congestion_destroy_share is its FRACTION of the destroy budget — must
+    # be reserved upfront, otherwise spatial+hessian saturate num_destroy
+    # and L's seeds get sliced off (bug fix 2026-05-20).
+    # Disabled by default: micro-A/B on ibm12/14/17 (LNS-loop level, 20 iters,
+    # seeds refreshed per iter) showed L loses to internal-random by 1.2-3x.
+    # L's seeds are intelligent but lack the exploration diversity that the
+    # placer's existing random-fill provides. Kept as opt-in flag for future
+    # variants (e.g. L + jitter, alternating exploit/explore).
+    "congestion_destroy_enabled": False,
+    "congestion_destroy_share": 0.3,
+    "congestion_destroy_top_n_bins": 8,
+    "congestion_destroy_macros_per_bin": 4,
+    # Lever K' — adaptive config from measured bench properties.
+    # No hardcoded bench names (would violate "must be general algorithm").
+    # Same formula every bench; different bench shapes get different overrides.
+    # Disabled by default: 60-90s smoke A/Bs on ibm12 showed null because LNS
+    # never fires at those budgets (CD eats wall time on big benches). K'
+    # tunes LNS knobs which need 3000s+ budgets to take effect.
+    "adaptive_config_enabled": False,
+    # Lever M — big-macro-first two-stage placement. Phase 1 sweeps only the
+    # top `two_stage_big_pct` macros by area with small macros frozen; phase 2
+    # (the rest of the restart) sweeps all macros from that warm-started
+    # scaffold. cd_loop-level micro-A/B (2026-05-20, ibm12/14/17) showed
+    # 0.98-1.23% proxy improvement, but placer-level A/B on ibm12 (60s/1r,
+    # polish-off) was proxy-neutral: M correctly reduces CONGESTION by 1.05%
+    # but density/wirelength compensate, total proxy unchanged. cd_loop-level
+    # signal was a 1-sweep artifact. Disabled by default; kept as opt-in for
+    # potential revisit at full 4-restart 3000s polish-on scale.
+    "two_stage_enabled": False,
+    "two_stage_big_pct": 0.3,
+    "two_stage_phase1_share": 0.25,
+    # Option 2 (Lever K' — adaptive config full rules). Default False preserves
+    # the prior congestion-only inline rule bit-exactly. Set True to enable the
+    # Rules A–D rule layer in macro_place.adaptive_config.
+    "adaptive_config_full_rules": False,
+    # Lever C — Rotation polish (final stage after candidate selection).
+    # When enabled, iterates each hard macro in its same orientation class
+    # (NS or EW) and picks the orientation that minimizes fast_proxy. Plc
+    # orientations are synced after so compute_proxy_cost sees the choices.
+    # Default False; flip to True after smoke + full-budget A/B confirm.
+    "rotation_polish_enabled": True,
+    "rotation_polish_top_k": 0,  # 0 = all hard macros
+    # Lever C Step E — joint orientation search inside cd_grid_search.
+    # When True, each CD sweep iterates the same-class orientations per macro
+    # in addition to the k_per_axis² position grid. ~4× per-sweep cost.
+    # Default False; opt-in via config.
+    "cd_orientation_search_enabled": False,
+    # Lever C Step F — LNS/SA rotation proposals.
+    # Both default 0.0 (no-op). When > 0, lns_destroy_rebuild and
+    # generate_sa_candidates also propose same-class rotations with the given
+    # per-decision probability. Requires an orientation_state to be threaded
+    # (built when cd_orientation_search_enabled=True or when either of these
+    # is > 0). Default 0.0 is bit-exact identical to the prior path.
+    "lns_rotation_probability": 0.0,
+    "sa_rotation_probability": 0.0,
 }
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def should_skip_targeted_sa_budget(
+    *,
+    elapsed_s: float,
+    time_budget_s: float,
+    min_remaining_s: float,
+) -> bool:
+    """Lever 6 (gate 1): skip targeted-SA generation if too little budget left.
+
+    Default no-op when ``min_remaining_s == 0.0``: returns False for any
+    elapsed/budget pair.
+    """
+    if float(min_remaining_s) <= 0.0:
+        return False
+    remaining = float(time_budget_s) - float(elapsed_s)
+    return remaining < float(min_remaining_s)
+
+
+def _targeted_sa_source_seed(base_seed: int, source_idx: int) -> int:
+    """Lever 2 helper: distinct seed per source so multi-source pools diverge.
+
+    Source 0 maps to ``base_seed`` exactly, preserving single-source behavior.
+    Subsequent sources offset by a large stride.
+    """
+    return int(base_seed) + int(source_idx) * 10_000
+
+
+def _top_k_candidates_by_key(candidates, k: int):
+    """Lever 5 helper: return up to K candidates with the smallest .key.
+
+    Sorts a copy ascending by .key (tuple lex compare matches
+    ``min(candidates, key=...)`` behavior at k=1). Returns ``[]`` for k<=0.
+    """
+    if int(k) <= 0:
+        return []
+    sorted_pool = sorted(candidates, key=lambda c: c.key)
+    return sorted_pool[: int(k)]
+
+
+def should_skip_targeted_sa_polish(
+    *,
+    min_escape_proxy: float,
+    source_proxy: float,
+    max_regression: float,
+) -> bool:
+    """Lever 6 (gate 2): skip top-k polish on SA candidates if they regress badly.
+
+    ``max_regression`` is in proxy units (absolute, not percent).
+    Default no-op when ``max_regression == math.inf``: returns False always.
+    Also returns False if the escape pool actually beat the source.
+    """
+    regression = float(min_escape_proxy) - float(source_proxy)
+    if regression <= 0.0:
+        return False
+    return regression > float(max_regression)
 
 
 @dataclass(frozen=True)
@@ -133,6 +309,9 @@ class _FinalCandidate:
     key: tuple[int, float]
     cost: dict[str, Any]
     stats: dict[str, Any]
+    # Lever C Step G — orientation array carried from worker → main → final selection.
+    # ``None`` means "no rotation lever applied; plc default orientations".
+    orientations: np.ndarray | None = None
 
 
 def _benchmark_path_for(bench_name: str) -> Path | None:
@@ -470,7 +649,7 @@ class CDLNSPlacer:
         seed: int,
         time_budget_s: float,
         restart_idx: int = 0,
-    ) -> tuple[np.ndarray, float]:
+    ) -> tuple[np.ndarray, float, np.ndarray | None]:
         """One restart: CD until plateau, then LNS until repeated failure or time-out."""
         cfg = self._config
         canvas_w = float(benchmark.canvas_width)
@@ -478,27 +657,38 @@ class CDLNSPlacer:
 
         modes = cfg.get("restart_modes", ("aggressive",)) or ("aggressive",)
         mode = modes[restart_idx % len(modes)]
-        if mode == "conservative":
-            radius_init_ratio = 1.0 / 32.0
-            max_sweeps = 5
-            do_lns = False
-            warm_sigma = 0.0
-        elif mode == "light":
-            radius_init_ratio = 1.0 / 16.0
-            max_sweeps = 10
-            do_lns = False
-            warm_sigma = 0.02
-        else:
-            radius_init_ratio = float(cfg["radius_init_ratio"])
-            max_sweeps = int(cfg["max_sweeps"])
-            do_lns = True
-            warm_sigma = float(cfg["warm_start_sigma"])
+        params = mode_params(mode, cfg)
+        radius_init_ratio = float(params["radius_init_ratio"])
+        max_sweeps = int(params["max_sweeps"])
+        do_lns = bool(params["do_lns"])
+        warm_sigma = float(params["warm_sigma"])
         cd_k_per_axis = (
             int(cfg["aggressive_cd_k_per_axis"]) if do_lns else int(cfg["k_per_axis"])
         )
         lns_k_per_axis = int(cfg["lns_k_per_axis"])
 
         pos = _warm_start_positions(benchmark, plc, seed=seed, sigma=warm_sigma)
+
+        # Lever C Steps E/F — build orientation state if any of CD orientation
+        # search, LNS rotation, or SA rotation is enabled. State lives across
+        # the restart's cd_loop/lns/sa iterations so each macro's current
+        # orientation persists. Cross-class transitions are disallowed by
+        # apply_rotation_to_cache (would corrupt density/overlap caches).
+        ori_search_enabled = bool(cfg.get("cd_orientation_search_enabled", False))
+        lns_rot_prob = float(cfg.get("lns_rotation_probability", 0.0))
+        sa_rot_prob = float(cfg.get("sa_rotation_probability", 0.0))
+        ori_state_needed = (
+            ori_search_enabled or lns_rot_prob > 0.0 or sa_rot_prob > 0.0
+        )
+        ori_state = None
+        if ori_state_needed:
+            try:
+                ori_state = build_orientation_state(ctx, plc, benchmark)
+            except Exception:
+                ori_state = None
+                ori_search_enabled = False
+                lns_rot_prob = 0.0
+                sa_rot_prob = 0.0
 
         start = time.perf_counter()
         consecutive_lns_failures = 0
@@ -531,6 +721,54 @@ class CDLNSPlacer:
         hessian_destroy_seeds: np.ndarray | None = None
         lns_iters_since_refresh = 0
 
+        # Lever M — big-macro-first warm-up. Phase 1 sweeps ONLY the top
+        # `two_stage_big_pct` macros by area, with small ones frozen at
+        # initial positions. Big macros dominate congestion (proportional to
+        # area covered by routing bins), so settling them first gives the
+        # full sweep a cleaner congestion field to work with.
+        # Micro-A/B (2026-05-20, ibm12/14/17): two-stage beat single-stage
+        # by 0.98-1.23% on each bench at cd_loop level.
+        if bool(cfg.get("two_stage_enabled", True)):
+            num_hard = int(getattr(benchmark, "num_hard_macros", 0))
+            if num_hard >= 4:
+                hard_areas = (
+                    ctx.macro_w[:num_hard] * ctx.macro_h[:num_hard]
+                ).astype(np.float64)
+                big_pct = float(cfg.get("two_stage_big_pct", 0.3))
+                big_threshold = float(np.percentile(hard_areas, (1.0 - big_pct) * 100.0))
+                # freeze_mask covers ALL positions: small hard macros + every soft
+                freeze_mask = np.ones(best_pos.shape[0], dtype=bool)
+                freeze_mask[:num_hard] = hard_areas < big_threshold
+                n_big = int((~freeze_mask[:num_hard]).sum())
+                if n_big >= 2:
+                    phase1_share = float(cfg.get("two_stage_phase1_share", 0.25))
+                    phase1_budget = max(1.0, time_budget_s * phase1_share)
+                    p1_result = cd_loop(
+                        initial_positions=best_pos,
+                        ctx=ctx,
+                        canvas_w=canvas_w,
+                        canvas_h=canvas_h,
+                        max_sweeps=max_sweeps,
+                        k_per_axis=cd_k_per_axis,
+                        radius_init_ratio=radius_init_ratio,
+                        radius_min_ratio=float(cfg["radius_min_ratio"]),
+                        time_budget_s=phase1_budget,
+                        seed=seed,
+                        freeze_mask=freeze_mask,
+                        tiebreak_enabled=bool(
+                            cfg.get("cd_congestion_tiebreak_enabled", False)
+                        ),
+                        tie_epsilon_rel=float(
+                            cfg.get("cd_congestion_tiebreak_epsilon", 1e-3)
+                        ),
+                    )
+                    if p1_result.final_cost + 1e-9 < best_cost:
+                        best_pos = p1_result.positions.copy()
+                        best_cost = p1_result.final_cost
+                        stats["two_stage_phase1_improvement"] = True
+                    stats["two_stage_phase1_proxy"] = float(p1_result.final_cost)
+                    stats["two_stage_n_big"] = n_big
+
         while time.perf_counter() - start < time_budget_s:
             # CD phase
             cd_remaining = time_budget_s - (time.perf_counter() - start)
@@ -558,6 +796,14 @@ class CDLNSPlacer:
                 radius_min_ratio=float(cfg["radius_min_ratio"]),
                 time_budget_s=cd_budget,
                 seed=seed,
+                tiebreak_enabled=bool(
+                    cfg.get("cd_congestion_tiebreak_enabled", False)
+                ),
+                tie_epsilon_rel=float(
+                    cfg.get("cd_congestion_tiebreak_epsilon", 1e-3)
+                ),
+                orientation_state=ori_state,
+                search_orientations=ori_search_enabled,
             )
             if cd_result.final_cost + 1e-9 < best_cost:
                 best_pos = cd_result.positions.copy()
@@ -615,6 +861,10 @@ class CDLNSPlacer:
             # hard macros inside the densest grid cell(s); recomputed every
             # LNS iteration since best_pos shifts. Cheap (~O(num_hard *
             # grid_size^2) cells touched), runs in microseconds for 1k macros.
+            # Seed priority: spatial seeds first, with Hessian extras filling
+            # the remaining destroy budget.
+            # Round-robin interleaving regressed ibm01 smoke 0.8362 → 0.8661
+            # because it pushed hessian seeds ahead of spatial ones.
             num_destroy_target = int(cfg["lns_num_destroy"])
             destroy_seeds = hessian_destroy_seeds
             if bool(cfg.get("spatial_window_destroy_enabled", False)):
@@ -638,8 +888,6 @@ class CDLNSPlacer:
                     stats["spatial_window_seeds_total"] += int(spatial_seeds.size)
                     if spatial_seeds.size > 0:
                         if hessian_destroy_seeds is not None:
-                            # Append Hessian seeds that aren't already in
-                            # spatial_seeds, until num_destroy reached.
                             spatial_set = set(spatial_seeds.tolist())
                             extras = np.array(
                                 [
@@ -654,6 +902,43 @@ class CDLNSPlacer:
                             )[:num_destroy_target]
                         else:
                             destroy_seeds = spatial_seeds
+            # Lever L — worst-congestion-bin destroy seeds. Reserves
+            # ``congestion_destroy_share`` of the destroy budget UPFRONT
+            # (before being merged with spatial+hessian) so its seeds
+            # aren't sliced off by capacity. Prepends to destroy_seeds
+            # so L's macros are LNS-rebuilt first.
+            if bool(cfg.get("congestion_destroy_enabled", True)):
+                cong_share = float(cfg.get("congestion_destroy_share", 0.3))
+                cong_count = max(1, int(round(num_destroy_target * cong_share)))
+                cong_seeds = worst_congestion_bin_destroy_seeds(
+                    positions=best_pos,
+                    ctx=ctx,
+                    num_seeds=cong_count,
+                    top_n_bins=int(cfg.get("congestion_destroy_top_n_bins", 8)),
+                    macros_per_bin=int(
+                        cfg.get("congestion_destroy_macros_per_bin", 4)
+                    ),
+                )
+                stats.setdefault("congestion_destroy_seeds_total", 0)
+                stats["congestion_destroy_seeds_total"] += int(cong_seeds.size)
+                if cong_seeds.size > 0:
+                    if destroy_seeds is not None and destroy_seeds.size > 0:
+                        existing_after_cong = set(cong_seeds.tolist())
+                        existing_tail = np.array(
+                            [
+                                int(s)
+                                for s in destroy_seeds.tolist()
+                                if int(s) not in existing_after_cong
+                            ],
+                            dtype=np.int64,
+                        )
+                        destroy_seeds = np.concatenate(
+                            [cong_seeds, existing_tail]
+                        )[:num_destroy_target]
+                    else:
+                        destroy_seeds = cong_seeds[:num_destroy_target]
+            if destroy_seeds is not None and destroy_seeds.size == 0:
+                destroy_seeds = None
 
             new_pos, accepted, _ = lns_destroy_rebuild(
                 positions=best_pos,
@@ -665,6 +950,8 @@ class CDLNSPlacer:
                 k_per_axis=lns_k_per_axis,
                 seed=seed + 100,
                 destroy_seed_indices=destroy_seeds,
+                orientation_state=ori_state if lns_rot_prob > 0.0 else None,
+                rotation_probability=lns_rot_prob,
             )
             if accepted:
                 best_pos = new_pos
@@ -681,16 +968,89 @@ class CDLNSPlacer:
         stats["final_cost"] = float(best_cost)
         stats["runtime_s"] = float(time.perf_counter() - start)
         self._last_restart_stats = stats
-        return best_pos, best_cost
+        # Step G: return final orientations alongside positions so the main
+        # process can sync plc before scoring. None when CD orientation search
+        # was disabled (default).
+        final_orientations: np.ndarray | None = None
+        if ori_state is not None and (
+            ori_search_enabled or lns_rot_prob > 0.0 or sa_rot_prob > 0.0
+        ):
+            final_orientations = np.asarray(
+                ori_state.macro_orientation, dtype=np.int8
+            ).copy()
+        return best_pos, best_cost, final_orientations
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         plc = resolve_plc(benchmark)
         if plc is None:
             raise RuntimeError(f"resolve_plc returned None for {benchmark.name}")
+        # Expose the internal plc so callers can read the final orientations
+        # / state after place() returns (e.g. for in-memory rescoring).
+        self._last_plc = plc
 
         ctx = build_fast_proxy_context(plc, benchmark)
         self._last_fast_proxy_context = ctx
 
+        # Lever K' — adaptive config from measured bench properties.
+        # General algorithm (no hardcoded bench names — that would violate
+        # the "must be general algorithm" rule). Same formula for every
+        # bench; different bench shapes get different config overrides.
+        # Restored at the end so the next call starts from defaults.
+        _saved_config: dict[str, Any] | None = None
+        if bool(self._config.get("adaptive_config_enabled", True)):
+            adaptive_overrides = self._compute_adaptive_overrides(plc, ctx, benchmark)
+            if adaptive_overrides:
+                _saved_config = dict(self._config)
+                self._config.update(adaptive_overrides)
+
+        try:
+            return self._place_inner(benchmark, plc, ctx)
+        finally:
+            if _saved_config is not None:
+                self._config = _saved_config
+
+    def _compute_adaptive_overrides(
+        self, plc: Any, ctx: Any, benchmark: Benchmark
+    ) -> dict[str, Any]:
+        """Measure bench shape, return config overrides (Lever K').
+
+        Default: legacy Rule A only (cong_share > 0.6 path). Set
+        ``adaptive_config_full_rules=True`` to enable the Rules A–D layer
+        from ``macro_place.adaptive_config``.
+        """
+        try:
+            initial = self._initial_positions(benchmark, plc)
+        except Exception:
+            return {}
+        init = fast_proxy(initial, ctx)
+        if init.proxy_cost <= 0.0:
+            return {}
+        if bool(self._config.get("adaptive_config_full_rules", False)):
+            num_macros = int(getattr(benchmark, "num_macros", 0))
+            metrics = extract_bench_metrics(
+                initial_proxy_cost=float(init.proxy_cost),
+                initial_wirelength=float(init.wirelength),
+                initial_density=float(init.density),
+                initial_congestion=float(init.congestion),
+                num_macros=num_macros,
+            )
+            return adaptive_overrides_from_metrics(metrics, self._config)
+        # Legacy Rule A only (bit-exact prior behavior).
+        cong_share = 0.5 * init.congestion / init.proxy_cost
+        overrides: dict[str, Any] = {}
+        if cong_share > 0.6:
+            base_cd = float(self._config.get("cd_phase_time_budget_s", 60.0))
+            base_fails = int(self._config.get("max_consecutive_lns_failures", 3))
+            base_destroy = int(self._config.get("lns_num_destroy", 10))
+            overrides["cd_phase_time_budget_s"] = base_cd * 0.5
+            overrides["max_consecutive_lns_failures"] = base_fails * 2
+            overrides["lns_num_destroy"] = max(base_destroy, int(base_destroy * 1.5))
+        return overrides
+
+    def _place_inner(
+        self, benchmark: Benchmark, plc: Any, ctx: Any
+    ) -> torch.Tensor:
+        place_start = time.perf_counter()
         time_budget_s = float(self._config["time_budget_s"])
         topk_budget_s = _topk_polish_budget(self._config)
         num_restarts = int(self._config["num_restarts"])
@@ -705,28 +1065,122 @@ class CDLNSPlacer:
 
         initial_pos = self._initial_positions(benchmark, plc)
         initial_stats: dict[str, Any] = {"restart_idx": -1, "mode": "initial_guard"}
-        results: list[tuple[np.ndarray, float, dict[str, Any]]] = [
-            (initial_pos, 0.0, initial_stats)
+        results: list[tuple[np.ndarray, float, dict[str, Any], np.ndarray | None]] = [
+            (initial_pos, 0.0, initial_stats, None)
         ]
         self._last_run_stats = {
             "benchmark": benchmark.name,
             "num_restarts": num_restarts,
             "per_restart_s": float(per_restart_s),
             "restarts": [],
+            "sa_generator_enabled": bool(self._config["sa_generator_enabled"]),
+            "sa_generator_candidates": 0,
+            "targeted_sa_escape_enabled": bool(
+                self._config["targeted_sa_escape_enabled"]
+            ),
+            "targeted_sa_escape_candidates": 0,
+            "cd_congestion_tiebreak_enabled": bool(
+                self._config["cd_congestion_tiebreak_enabled"]
+            ),
+            "cd_congestion_tiebreak_epsilon": float(
+                self._config["cd_congestion_tiebreak_epsilon"]
+            ),
             "topk_polish_enabled": bool(self._config["topk_polish_enabled"]),
             "topk_polish_attempts": 0,
             "topk_polish_accepts": 0,
             "topk_polish_events": [],
+            # Lever 6 (runtime-aware gating). Populated lazily when targeted-SA runs.
+            "targeted_sa_gated_reason": None,
+            "targeted_sa_gated_elapsed_s": None,
+            "targeted_sa_gated_remaining_s": None,
+            "targeted_sa_polish_gated_reason": None,
+            "targeted_sa_polish_gated_regression": None,
         }
+
+        if bool(self._config["sa_generator_enabled"]):
+            # Step F: if sa_rotation_probability > 0, build an orientation
+            # state so the SA inner loop can also propose same-class rotations.
+            # The internal _rescore_archive re-evaluates with the final ctx
+            # pin offsets, so the final orientations are attached to every
+            # candidate to keep the worker's plc state consistent.
+            sa_gen_rot_prob = float(
+                self._config.get("sa_rotation_probability", 0.0)
+            )
+            sa_ori_state = None
+            if sa_gen_rot_prob > 0.0:
+                try:
+                    sa_ori_state = build_orientation_state(ctx, plc, benchmark)
+                except Exception:
+                    sa_ori_state = None
+                    sa_gen_rot_prob = 0.0
+            sa_candidates = generate_sa_candidates(
+                initial_positions=initial_pos,
+                ctx=ctx,
+                canvas_w=float(benchmark.canvas_width),
+                canvas_h=float(benchmark.canvas_height),
+                seed=int(self._config["sa_generator_seed"]),
+                steps=int(self._config["sa_generator_steps"]),
+                num_candidates=int(self._config["sa_generator_num_candidates"]),
+                initial_temperature_ratio=float(
+                    self._config["sa_generator_initial_temperature_ratio"]
+                ),
+                final_temperature_ratio=float(
+                    self._config["sa_generator_final_temperature_ratio"]
+                ),
+                global_move_probability=float(
+                    self._config["sa_generator_global_move_probability"]
+                ),
+                overlap_penalty=float(self._config["sa_generator_overlap_penalty"]),
+                diversity_distance_ratio=float(
+                    self._config["sa_generator_diversity_distance_ratio"]
+                ),
+                exact_rescore_pool_size=int(
+                    self._config["sa_generator_exact_rescore_pool_size"]
+                ),
+                pre_legalize_iters=int(
+                    self._config["sa_generator_pre_legalize_iters"]
+                ),
+                orientation_state=sa_ori_state,
+                rotation_probability=sa_gen_rot_prob,
+            )
+            sa_candidate_orientations: np.ndarray | None = None
+            if sa_ori_state is not None and sa_gen_rot_prob > 0.0:
+                sa_candidate_orientations = np.asarray(
+                    sa_ori_state.macro_orientation, dtype=np.int8
+                ).copy()
+            for candidate_idx, candidate in enumerate(sa_candidates):
+                results.append(
+                    (
+                        candidate.positions,
+                        float(candidate.proxy_cost),
+                        {
+                            "restart_idx": -2,
+                            "mode": "sa_generator",
+                            "candidate_kind": "sa_generator",
+                            "candidate_idx": int(candidate_idx),
+                            "sa_objective": float(candidate.objective),
+                            "sa_proxy_cost": float(candidate.proxy_cost),
+                            "sa_overlap_count": int(candidate.overlap_count),
+                            "sa_evaluations": int(candidate.evaluations),
+                            "sa_accepted_moves": int(candidate.accepted_moves),
+                        },
+                        sa_candidate_orientations,
+                    )
+                )
+            self._last_run_stats["sa_generator_candidates"] = int(len(sa_candidates))
+            if sa_candidates:
+                self._last_run_stats["sa_generator_best_proxy"] = float(
+                    min(candidate.proxy_cost for candidate in sa_candidates)
+                )
 
         if num_restarts >= 1:
             if num_restarts == 1:
-                pos, _ = self._run_one_restart(
+                pos, _, orientations = self._run_one_restart(
                     benchmark=benchmark, ctx=ctx, plc=plc, seed=0,
                     time_budget_s=per_restart_s, restart_idx=0,
                 )
                 restart_stats = dict(self._last_restart_stats)
-                results.append((pos, 0.0, restart_stats))
+                results.append((pos, 0.0, restart_stats, orientations))
                 self._last_run_stats["restarts"].append(restart_stats)
             else:
                 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -742,12 +1196,12 @@ class CDLNSPlacer:
                         f"no cached benchmark file for {benchmark.name}; running serially"
                     )
                     for seed in range(num_restarts):
-                        pos, _ = self._run_one_restart(
+                        pos, _, orientations_serial = self._run_one_restart(
                             benchmark=benchmark, ctx=ctx, plc=plc, seed=seed,
                             time_budget_s=per_restart_s, restart_idx=seed,
                         )
                         restart_stats = dict(self._last_restart_stats)
-                        results.append((pos, 0.0, restart_stats))
+                        results.append((pos, 0.0, restart_stats, orientations_serial))
                         self._last_run_stats["restarts"].append(restart_stats)
                     bench_path = None  # skip the ProcessPool block below
                 if bench_path is not None:
@@ -790,12 +1244,15 @@ class CDLNSPlacer:
                                     f"{type(exc).__name__}: {str(exc)[:200]}"
                                 )
                                 continue
+                            orientations: np.ndarray | None = None
                             if len(item) == 2:
                                 pos, surrogate = item
                                 restart_stats = {}
-                            else:
+                            elif len(item) == 3:
                                 pos, surrogate, restart_stats = item
-                            results.append((pos, surrogate, restart_stats))
+                            else:  # 4-tuple (Step G)
+                                pos, surrogate, restart_stats, orientations = item
+                            results.append((pos, surrogate, restart_stats, orientations))
                             self._last_run_stats["restarts"].append(restart_stats)
 
         # Legalize every candidate and pick by (overlap_count, proxy_cost) so
@@ -809,8 +1266,9 @@ class CDLNSPlacer:
                 benchmark=benchmark,
                 plc=plc,
                 stats=candidate_stats,
+                orientations=cand_orientations,
             )
-            for pos_arr, _surrogate, candidate_stats in results
+            for pos_arr, _surrogate, candidate_stats, cand_orientations in results
         ]
         self._last_final_candidates = list(candidates)
         candidates.extend(
@@ -826,34 +1284,212 @@ class CDLNSPlacer:
         )
         proxy_best_candidate = min(candidates, key=lambda candidate: candidate.key)
 
+        # Lever 6 gate 1: skip targeted-SA if elapsed wall leaves too little
+        # budget. Default no-op (min_remaining_s == 0.0).
+        _sa_enabled = bool(self._config["targeted_sa_escape_enabled"])
+        _sa_skip_budget = False
+        if _sa_enabled:
+            _sa_elapsed_s = time.perf_counter() - place_start
+            self._last_run_stats["targeted_sa_gated_elapsed_s"] = float(_sa_elapsed_s)
+            self._last_run_stats["targeted_sa_gated_remaining_s"] = float(
+                time_budget_s - _sa_elapsed_s
+            )
+            _sa_skip_budget = should_skip_targeted_sa_budget(
+                elapsed_s=_sa_elapsed_s,
+                time_budget_s=time_budget_s,
+                min_remaining_s=float(
+                    self._config["targeted_sa_min_remaining_budget_s"]
+                ),
+            )
+            if _sa_skip_budget:
+                self._last_run_stats["targeted_sa_gated_reason"] = "budget"
+
+        if _sa_enabled and not _sa_skip_budget:
+            # Lever 2: SA from top-K source candidates. k=1 (default) = current
+            # single-source behavior (proxy_best). Seed offset per source keeps
+            # SA pools divergent.
+            sa_source_top_k = int(self._config["targeted_sa_source_top_k"])
+            sa_sources = _top_k_candidates_by_key(candidates, sa_source_top_k)
+            scored_escape_candidates: list[_FinalCandidate] = []
+            sa_target_strategy = str(
+                self._config.get("targeted_sa_target_strategy", "congestion")
+            )
+            for source_idx, source_candidate in enumerate(sa_sources):
+                escape_seed_positions = (
+                    source_candidate.legalized_positions.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=True)
+                )
+                source_seed = _targeted_sa_source_seed(
+                    int(self._config["targeted_sa_escape_seed"]), source_idx
+                )
+                # Lever 3: pick targets via strategy. "hybrid" overrides the
+                # default congestion-bin selector with a multi-factor score.
+                _target_override = None
+                if sa_target_strategy == "hybrid":
+                    _target_override = hybrid_target_hard_macros(
+                        escape_seed_positions,
+                        ctx,
+                        num_seeds=int(
+                            self._config["targeted_sa_escape_target_count"]
+                        ),
+                    )
+                escape_candidates = generate_targeted_sa_escape_candidates(
+                    initial_positions=escape_seed_positions,
+                    ctx=ctx,
+                    canvas_w=float(benchmark.canvas_width),
+                    canvas_h=float(benchmark.canvas_height),
+                    seed=source_seed,
+                    steps=int(self._config["targeted_sa_escape_steps"]),
+                    num_candidates=int(
+                        self._config["targeted_sa_escape_num_candidates"]
+                    ),
+                    target_count=int(self._config["targeted_sa_escape_target_count"]),
+                    top_n_bins=int(self._config["targeted_sa_escape_top_n_bins"]),
+                    macros_per_bin=int(
+                        self._config["targeted_sa_escape_macros_per_bin"]
+                    ),
+                    exact_rescore_pool_size=int(
+                        self._config["targeted_sa_escape_exact_rescore_pool_size"]
+                    ),
+                    target_indices_override=_target_override,
+                    adaptive_temperature=(
+                        str(self._config.get("targeted_sa_temperature_mode", "static"))
+                        == "adaptive"
+                    ),
+                    adaptive_num_trials=int(
+                        self._config.get("targeted_sa_adaptive_num_trials", 64)
+                    ),
+                    adaptive_target_accept=float(
+                        self._config.get("targeted_sa_adaptive_target_accept", 0.5)
+                    ),
+                )
+                for candidate_idx, candidate in enumerate(escape_candidates):
+                    scored = _score_legalized_candidate(
+                        raw_positions=candidate.positions,
+                        benchmark=benchmark,
+                        plc=plc,
+                        stats={
+                            "restart_idx": -3,
+                            "mode": "targeted_sa_escape",
+                            "candidate_kind": "targeted_sa_escape",
+                            "candidate_idx": int(candidate_idx),
+                            "source_idx": int(source_idx),
+                            "escape_source_key": tuple(source_candidate.key),
+                            "sa_objective": float(candidate.objective),
+                            "sa_proxy_cost": float(candidate.proxy_cost),
+                            "sa_overlap_count": int(candidate.overlap_count),
+                            "sa_evaluations": int(candidate.evaluations),
+                            "sa_accepted_moves": int(candidate.accepted_moves),
+                        },
+                    )
+                    candidates.append(scored)
+                    scored_escape_candidates.append(scored)
+            self._last_run_stats["targeted_sa_escape_candidates"] = int(
+                len(scored_escape_candidates)
+            )
+            self._last_run_stats["targeted_sa_source_top_k"] = sa_source_top_k
+            self._last_run_stats["targeted_sa_source_count"] = len(sa_sources)
+            if scored_escape_candidates:
+                self._last_run_stats["targeted_sa_escape_best_proxy"] = float(
+                    min(candidate.key[1] for candidate in scored_escape_candidates)
+                )
+                # Keep the single-source "source_key" for back-compat with the
+                # probe / auto-memory; it points at the first (proxy-best) source.
+                self._last_run_stats["targeted_sa_escape_source_key"] = tuple(
+                    sa_sources[0].key if sa_sources else proxy_best_candidate.key
+                )
+            escape_polish_budget_s = float(
+                self._config["targeted_sa_escape_polish_time_budget_s"]
+            )
+            # Lever 6 gate 2: skip polish if SA candidates regressed badly vs
+            # source. Default no-op (max_regression == math.inf).
+            _sa_polish_skip = False
+            if scored_escape_candidates and escape_polish_budget_s > 0.0:
+                _sa_source_proxy = float(proxy_best_candidate.key[1])
+                _sa_min_escape_proxy = float(
+                    min(c.key[1] for c in scored_escape_candidates)
+                )
+                _sa_polish_skip = should_skip_targeted_sa_polish(
+                    min_escape_proxy=_sa_min_escape_proxy,
+                    source_proxy=_sa_source_proxy,
+                    max_regression=float(
+                        self._config["targeted_sa_max_proxy_regression_to_polish"]
+                    ),
+                )
+                if _sa_polish_skip:
+                    self._last_run_stats["targeted_sa_polish_gated_reason"] = "quality"
+                    self._last_run_stats["targeted_sa_polish_gated_regression"] = (
+                        _sa_min_escape_proxy - _sa_source_proxy
+                    )
+            if (
+                scored_escape_candidates
+                and escape_polish_budget_s > 0.0
+                and not _sa_polish_skip
+            ):
+                candidates.extend(
+                    _topk_final_polish(
+                        candidates=scored_escape_candidates,
+                        benchmark=benchmark,
+                        plc=plc,
+                        ctx=ctx,
+                        cfg=self._config,
+                        time_budget_s=escape_polish_budget_s,
+                        run_stats=self._last_run_stats,
+                    )
+                )
+            proxy_best_candidate = min(candidates, key=lambda candidate: candidate.key)
+
         # Hessian saddle escape (E12): try to escape coupled-macro saddles
         # invisible to single-macro CD. Accepts only on strict improvement.
-        # Pass a diagnostics dict so we capture eigenvalues even on reject.
-        hessian_diag: dict[str, Any] = {}
-        hessian_candidate = _hessian_escape_polish_candidate(
-            proxy_best_candidate,
-            benchmark,
-            plc,
-            ctx,
-            self._config,
-            diagnostics=hessian_diag,
+        # Lever 5: when hessian_escape_top_k > 1, run on the top-K candidates
+        # by key. Default (k=1) preserves the proven single-shot behavior.
+        hessian_top_k = int(self._config.get("hessian_escape_top_k", 1))
+        hessian_sources = _top_k_candidates_by_key(candidates, hessian_top_k)
+        hessian_diagnostics_all: list[dict[str, Any]] = []
+        hessian_accepted_count = 0
+        first_accepted: _FinalCandidate | None = None
+        first_accepted_source = None
+        for source in hessian_sources:
+            diag: dict[str, Any] = {}
+            new_c = _hessian_escape_polish_candidate(
+                source,
+                benchmark,
+                plc,
+                ctx,
+                self._config,
+                diagnostics=diag,
+            )
+            hessian_diagnostics_all.append(diag)
+            if new_c is not None:
+                candidates.append(new_c)
+                hessian_accepted_count += 1
+                if first_accepted is None:
+                    first_accepted = new_c
+                    first_accepted_source = source
+        # Stats — preserve the single-slot keys for backwards compatibility
+        # (probe scripts + auto-memory still read these). Diagnostics dict
+        # is the first one; full list is in *_all.
+        self._last_run_stats["hessian_diagnostics"] = (
+            hessian_diagnostics_all[0] if hessian_diagnostics_all else {}
         )
-        self._last_run_stats["hessian_diagnostics"] = hessian_diag
-        if hessian_candidate is not None:
-            candidates.append(hessian_candidate)
-            self._last_run_stats["hessian_escape_accepted"] = True
+        self._last_run_stats["hessian_diagnostics_all"] = hessian_diagnostics_all
+        self._last_run_stats["hessian_escape_top_k"] = hessian_top_k
+        self._last_run_stats["hessian_escape_accepted_count"] = hessian_accepted_count
+        self._last_run_stats["hessian_escape_accepted"] = hessian_accepted_count > 0
+        if first_accepted is not None and first_accepted_source is not None:
             self._last_run_stats["hessian_escape_source_key"] = list(
-                proxy_best_candidate.key
+                first_accepted_source.key
             )
-            self._last_run_stats["hessian_escape_new_key"] = list(
-                hessian_candidate.key
+            self._last_run_stats["hessian_escape_new_key"] = list(first_accepted.key)
+            self._last_run_stats["hessian_escape_source"] = (
+                first_accepted.stats.get("hessian_escape_source")
             )
-            self._last_run_stats["hessian_escape_source"] = hessian_candidate.stats.get(
-                "hessian_escape_source"
-            )
-            proxy_best_candidate = hessian_candidate
-        else:
-            self._last_run_stats["hessian_escape_accepted"] = False
+        # Re-pick proxy-best from the (possibly extended) candidate pool. For
+        # k=1 this matches the prior `proxy_best_candidate = hessian_candidate`
+        # assignment because hessian only returns on strict improvement.
+        proxy_best_candidate = min(candidates, key=lambda c: c.key)
 
         spacing_candidate = _orfs_spacing_polish_candidate(
             proxy_best_candidate,
@@ -878,9 +1514,73 @@ class CDLNSPlacer:
             benchmark,
             self._config,
         )
+        self._last_run_stats["candidate_summary"] = _summarize_final_candidates(
+            candidates
+        )
         self._last_run_stats["selected_key"] = best_candidate.key
         self._last_run_stats["selected_restart"] = dict(best_candidate.stats)
         self._last_run_stats["orfs_final_selection"] = selection_stats
+
+        # Lever C Step G — sync plc orientations to the SELECTED candidate so
+        # any downstream scoring (polish, eval) sees its orientations. Without
+        # this, the last candidate _score_legalized_candidate touched is what
+        # plc remembers.
+        try:
+            from macro_place.orientation import orientation_name
+            hard_idx = list(getattr(benchmark, "hard_macro_indices", []))
+            if best_candidate.orientations is not None:
+                arr = np.asarray(best_candidate.orientations, dtype=np.int8)
+                for i in range(min(len(hard_idx), arr.shape[0])):
+                    ori_idx = int(arr[i])
+                    if 0 <= ori_idx < 8:
+                        plc.update_macro_orientation(
+                            int(hard_idx[i]), orientation_name(ori_idx)
+                        )
+            else:
+                for plc_idx in hard_idx:
+                    plc.update_macro_orientation(int(plc_idx), "N")
+        except Exception:
+            pass
+
+        # Lever C — Rotation polish (gated). Operates on the selected
+        # candidate's positions; mutates plc orientations in place so the
+        # next compute_proxy_cost reflects the polished orientations.
+        if bool(self._config.get("rotation_polish_enabled", False)):
+            try:
+                ori_state = build_orientation_state(ctx, plc, benchmark)
+                pos_np_for_polish = (
+                    best_candidate.legalized_positions
+                    .detach().cpu().numpy().astype(np.float64, copy=True)
+                )
+                top_k = int(self._config.get("rotation_polish_top_k", 0)) or len(
+                    getattr(benchmark, "hard_macro_indices", [])
+                )
+                polish = polish_orientations_fast(
+                    positions_np=pos_np_for_polish,
+                    ctx=ctx,
+                    state=ori_state,
+                    benchmark=benchmark,
+                    plc=plc,
+                    top_k=top_k,
+                )
+                self._last_run_stats["rotation_polish_enabled"] = True
+                self._last_run_stats["rotation_polish_improved_count"] = int(
+                    polish["improved_count"]
+                )
+                self._last_run_stats["rotation_polish_initial_proxy"] = float(
+                    polish["initial_proxy"]
+                )
+                self._last_run_stats["rotation_polish_final_proxy"] = float(
+                    polish["final_proxy"]
+                )
+                self._last_run_stats["rotation_polish_official_proxy"] = float(
+                    polish["final_official_proxy"]
+                )
+            except Exception as exc:
+                self._last_run_stats["rotation_polish_error"] = (
+                    f"{type(exc).__name__}: {str(exc)[:200]}"
+                )
+
         self._last_run_stats["tier2_metrics"] = _tier2_metrics(
             best_candidate.legalized_positions,
             benchmark,
@@ -895,20 +1595,93 @@ def _score_legalized_candidate(
     benchmark: Benchmark,
     plc: Any,
     stats: dict[str, Any],
+    orientations: np.ndarray | None = None,
 ) -> _FinalCandidate:
     raw_copy = np.asarray(raw_positions, dtype=np.float64).copy()
     legalized = repair_overlaps(
         torch.as_tensor(raw_copy, dtype=torch.float32), benchmark
     )
+    # Lever C Step G — sync plc orientations before scoring. If orientations
+    # provided, apply them; otherwise reset to all-N (the default state) so
+    # scoring is consistent regardless of prior plc mutations.
+    try:
+        from macro_place.orientation import orientation_name
+        hard_idx = list(getattr(benchmark, "hard_macro_indices", []))
+        if orientations is not None:
+            arr = np.asarray(orientations, dtype=np.int8)
+            for i in range(min(len(hard_idx), arr.shape[0])):
+                ori_idx = int(arr[i])
+                if 0 <= ori_idx < 8:
+                    plc.update_macro_orientation(
+                        int(hard_idx[i]), orientation_name(ori_idx)
+                    )
+        else:
+            # Reset to N to avoid leaking prior candidate's orientations.
+            for plc_idx in hard_idx:
+                plc.update_macro_orientation(int(plc_idx), "N")
+    except Exception:
+        pass
     cost = dict(compute_proxy_cost(legalized, benchmark, plc))
     key = (int(cost["overlap_count"]), float(cost["proxy_cost"]))
+    ori_copy = (
+        np.asarray(orientations, dtype=np.int8).copy()
+        if orientations is not None
+        else None
+    )
     return _FinalCandidate(
         raw_positions=raw_copy,
         legalized_positions=legalized,
         key=key,
         cost=cost,
         stats=dict(stats),
+        orientations=ori_copy,
     )
+
+
+def _summarize_final_candidates(
+    candidates: list[_FinalCandidate],
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    best_by_source: dict[str, dict[str, Any]] = {}
+    for idx, candidate in enumerate(candidates):
+        source = _candidate_source(candidate.stats)
+        row = {
+            "idx": int(idx),
+            "source": source,
+            "mode": str(candidate.stats.get("mode", "unknown")),
+            "candidate_kind": str(candidate.stats.get("candidate_kind", source)),
+            "restart_idx": int(candidate.stats.get("restart_idx", -99)),
+            "overlap_count": int(candidate.key[0]),
+            "proxy_cost": float(candidate.key[1]),
+            "raw_proxy_cost": float(
+                candidate.stats.get("sa_proxy_cost", candidate.key[1])
+            ),
+        }
+        rows.append(row)
+        current = best_by_source.get(source)
+        if current is None or (row["overlap_count"], row["proxy_cost"]) < (
+            int(current["overlap_count"]),
+            float(current["proxy_cost"]),
+        ):
+            best_by_source[source] = dict(row)
+
+    rows.sort(key=lambda row: (int(row["overlap_count"]), float(row["proxy_cost"])))
+    return {
+        "candidate_count": int(len(candidates)),
+        "best_by_source": best_by_source,
+        "top_candidates": rows[: min(12, len(rows))],
+    }
+
+
+def _candidate_source(stats: dict[str, Any]) -> str:
+    kind = str(stats.get("candidate_kind", ""))
+    if kind:
+        return kind
+    mode = str(stats.get("mode", ""))
+    if mode:
+        return mode
+    restart_idx = stats.get("restart_idx")
+    return f"restart_{restart_idx}" if restart_idx is not None else "unknown"
 
 
 def _proxy_tie_limit(best_proxy: float, rel_tol: float) -> float:
@@ -1392,19 +2165,13 @@ def _orfs_spacing_polish_candidate(
 
     cost = dict(compute_proxy_cost(polished, benchmark, plc))
     polished_key_real = (int(cost["overlap_count"]), float(cost["proxy_cost"]))
-    # Use the base candidate's key (NOT the polished proxy) so the polish
-    # always passes the tie-pool's tight rel_tol admission check in
-    # _select_final_candidate. Without this, widening narrow channels — which
-    # legitimately costs 1–5% wirelength — kicks the polish out of the
-    # 0.1%-rel_tol tie pool and the ORFS-unsafe base candidate wins,
-    # crashing PDN. The selector still picks the polish only when its ORFS
-    # metrics strictly beat the base's via _orfs_candidate_sort_key, and the
-    # rank check above already gated on overall improvement, so this cannot
-    # silently degrade Tier 1 proxy.
+    # Rank the polished placement by its actual proxy. Reusing the source
+    # candidate's key can make a high-cost polish win final selection under a
+    # stale low proxy.
     return _FinalCandidate(
         raw_positions=_to_numpy_positions(polished),
         legalized_positions=polished,
-        key=candidate.key,
+        key=polished_key_real,
         cost=cost,
         stats={
             **candidate.stats,
@@ -1497,6 +2264,12 @@ def _topk_final_polish(
                 radius_min_ratio=radius_min_ratio,
                 time_budget_s=sweep_budget_s,
                 seed=base_seed + sweep_idx,
+                tiebreak_enabled=bool(
+                    cfg.get("cd_congestion_tiebreak_enabled", False)
+                ),
+                tie_epsilon_rel=float(
+                    cfg.get("cd_congestion_tiebreak_epsilon", 1e-3)
+                ),
             )
             total_evals += int(cd_result.total_evals)
             sweeps_completed += int(cd_result.sweeps_completed)
@@ -1585,9 +2358,13 @@ def _restart_worker(
     time_budget_s: float,
     config: dict[str, Any],
     restart_idx: int = 0,
-) -> tuple[np.ndarray, float, dict[str, Any]]:
+) -> tuple[np.ndarray, float, dict[str, Any], np.ndarray | None]:
     """Module-level worker for ProcessPool — picklable, builds its own
-    benchmark + plc + ctx so nothing is shared across processes."""
+    benchmark + plc + ctx so nothing is shared across processes.
+
+    Step G: returns a 4-tuple including a per-macro orientation index array
+    (or None when CD orientation search wasn't used).
+    """
     benchmark = Benchmark.load(bench_path)
     plc = resolve_plc(benchmark)
     if plc is None:
@@ -1597,8 +2374,8 @@ def _restart_worker(
     # Re-create a placer to reuse _run_one_restart
     placer = CDLNSPlacer()
     placer._config = dict(config)
-    pos, surrogate_cost = placer._run_one_restart(
+    pos, surrogate_cost, orientations = placer._run_one_restart(
         benchmark=benchmark, ctx=ctx, plc=plc, seed=seed,
         time_budget_s=time_budget_s, restart_idx=restart_idx,
     )
-    return pos, surrogate_cost, dict(placer._last_restart_stats)
+    return pos, surrogate_cost, dict(placer._last_restart_stats), orientations

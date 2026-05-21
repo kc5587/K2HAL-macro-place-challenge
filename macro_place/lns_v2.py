@@ -14,6 +14,9 @@ import numpy as np
 
 from macro_place.cd import cd_grid_search
 from macro_place.fast_proxy import FastProxyContext, fast_proxy
+from macro_place.fast_proxy_incremental import build_cache, cache_result
+from macro_place.orientation import OrientationState, orientation_class_indices
+from macro_place.orientation_cache import apply_rotation_to_cache
 
 
 def lns_destroy_rebuild(
@@ -26,6 +29,8 @@ def lns_destroy_rebuild(
     k_per_axis: int = 8,
     seed: int = 0,
     destroy_seed_indices: np.ndarray | None = None,
+    orientation_state: OrientationState | None = None,
+    rotation_probability: float = 0.0,
 ) -> Tuple[np.ndarray, bool, int]:
     """Destroy ``num_destroy`` nodes and CD-rebuild on that subset.
 
@@ -83,8 +88,19 @@ def lns_destroy_rebuild(
     radius = canvas_max * 0.25  # broad initial rebuild radius
 
     work = positions.copy()
-    base_cost = float(fast_proxy(work, ctx).proxy_cost)
+    cache = build_cache(work, ctx)
+    base_cost = float(cache_result(cache).proxy_cost)
     total_evals = 1
+
+    rotation_enabled = (
+        orientation_state is not None and float(rotation_probability) > 0.0
+    )
+    rot_prob = float(rotation_probability) if rotation_enabled else 0.0
+    initial_orientations = (
+        orientation_state.macro_orientation.copy()
+        if rotation_enabled and orientation_state is not None
+        else None
+    )
 
     current_cost = base_cost
     for it in range(max_lns_iters):
@@ -97,6 +113,7 @@ def lns_destroy_rebuild(
                 ctx=ctx,
                 radius=radius,
                 k_per_axis=k_per_axis,
+                cache=cache,
             )
             total_evals += k_per_axis * k_per_axis + 1
             if best_cost + 1e-9 < current_cost:
@@ -104,9 +121,59 @@ def lns_destroy_rebuild(
                 work[int(node_idx), 1] = best_pos[1]
                 current_cost = best_cost
                 improved_this_iter = True
+
+            if (
+                rotation_enabled
+                and orientation_state is not None
+                and rng.random() < rot_prob
+            ):
+                node_i = int(node_idx)
+                ori_state = orientation_state
+                cur_ori = int(ori_state.macro_orientation[node_i])
+                class_oris = orientation_class_indices(cur_ori)
+                best_alt_cost = current_cost
+                best_alt_ori = cur_ori
+                for alt_ori in class_oris:
+                    if int(alt_ori) == cur_ori:
+                        continue
+                    prev = apply_rotation_to_cache(
+                        cache, ctx, ori_state, node_i, int(alt_ori)
+                    )
+                    alt_cost = float(cache_result(cache).proxy_cost)
+                    total_evals += 1
+                    if alt_cost + 1e-9 < best_alt_cost:
+                        best_alt_cost = alt_cost
+                        best_alt_ori = int(alt_ori)
+                    apply_rotation_to_cache(cache, ctx, ori_state, node_i, prev)
+                if best_alt_ori != cur_ori:
+                    apply_rotation_to_cache(
+                        cache, ctx, ori_state, node_i, best_alt_ori
+                    )
+                    current_cost = best_alt_cost
+                    improved_this_iter = True
         if not improved_this_iter:
             break
 
+    final = fast_proxy(work, ctx)
+    current_cost = float(final.proxy_cost)
+    cache.total_hpwl = float(final.wirelength)
+    cache.total_density = float(final.density)
+    cache.total_congestion = float(final.congestion)
+    cache.total_overlap_count = int(final.overlap_count)
+
     if current_cost + 1e-9 < base_cost:
         return work, True, total_evals
+
+    # Reject: restore initial orientations so caller-visible state is unchanged.
+    if (
+        rotation_enabled
+        and orientation_state is not None
+        and initial_orientations is not None
+    ):
+        ori_state = orientation_state
+        for macro_i in range(initial_orientations.shape[0]):
+            target = int(initial_orientations[macro_i])
+            current = int(ori_state.macro_orientation[macro_i])
+            if target != current:
+                apply_rotation_to_cache(cache, ctx, ori_state, macro_i, target)
     return positions.copy(), False, total_evals
