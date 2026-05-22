@@ -53,6 +53,21 @@ def test_submission_default_config() -> None:
 
     placer = CDLNSPlacer()
 
+    # Broad-SA and Step F rotation-SA disabled for submission: partial 11-bench
+    # full IBM run showed +0.49% mean regression vs v1.1. Re-enable only after a
+    # true "no-worse" gate is in place. Lever C polish stays on (proven on ibm10).
+    assert placer._config["sa_generator_enabled"] is False
+    assert placer._config["sa_generator_num_candidates"] == 4
+    assert placer._config["sa_rotation_extra_source_enabled"] is False
+    assert placer._config["sa_rotation_extra_source_probability"] == pytest.approx(0.0)
+    assert placer._config["rotation_polish_enabled"] is True
+    assert placer._config["lns_rotation_probability"] == pytest.approx(0.0)
+    assert placer._config["sa_rotation_probability"] == pytest.approx(0.0)
+    assert placer._config["cd_orientation_search_enabled"] is False
+    assert placer._config["targeted_sa_escape_enabled"] is False
+    assert placer._config["targeted_sa_escape_num_candidates"] == 4
+    assert placer._config["cd_congestion_tiebreak_enabled"] is False
+    assert placer._config["cd_congestion_tiebreak_epsilon"] == pytest.approx(1e-3)
     assert placer._config["topk_polish_enabled"] is True
     assert placer._config["topk_polish_k"] == 8
     assert placer._config["topk_polish_time_budget_s"] == 480.0
@@ -65,6 +80,201 @@ def test_submission_default_config() -> None:
     assert placer._config["hessian_escape_enabled"] is True
     assert placer._config["hessian_escape_lanczos_iters"] == 16
     assert placer._config["hessian_escape_curvature_threshold"] == -1e-3
+
+
+@pytest.mark.unit
+def test_sa_generator_candidate_can_enter_final_selection(monkeypatch) -> None:
+    from macro_place.sa_generator import AnnealCandidate
+    from submissions.macro_placer import cd_lns_placer
+    from submissions.macro_placer.cd_lns_placer import CDLNSPlacer
+
+    class FakeBenchmark:
+        name = "fake"
+        canvas_width = 10.0
+        canvas_height = 10.0
+
+    def fake_generate_sa_candidates(**kwargs: object) -> list[AnnealCandidate]:
+        return [
+            AnnealCandidate(
+                positions=_marker_positions(3.0),
+                proxy_cost=0.3,
+                objective=0.3,
+                overlap_count=0,
+                evaluations=12,
+                accepted_moves=5,
+            )
+        ]
+
+    def fake_score(
+        pos_t: torch.Tensor, benchmark: object, plc: object
+    ) -> dict[str, float | int]:
+        marker = float(pos_t[0, 0])
+        return {"overlap_count": 0, "proxy_cost": marker}
+
+    monkeypatch.setattr(cd_lns_placer, "resolve_plc", lambda benchmark: object())
+    monkeypatch.setattr(
+        cd_lns_placer, "build_fast_proxy_context", lambda plc, benchmark: object()
+    )
+    monkeypatch.setattr(
+        CDLNSPlacer,
+        "_initial_positions",
+        lambda self, benchmark, plc: _marker_positions(9.0),
+    )
+    monkeypatch.setattr(
+        cd_lns_placer, "generate_sa_candidates", fake_generate_sa_candidates
+    )
+    monkeypatch.setattr(cd_lns_placer, "repair_overlaps", lambda pos_t, benchmark: pos_t)
+    monkeypatch.setattr(cd_lns_placer, "compute_proxy_cost", fake_score)
+
+    placer = CDLNSPlacer()
+    placer._config["num_restarts"] = 0
+    placer._config["sa_generator_enabled"] = True
+    placer._config["topk_polish_enabled"] = False
+    placer._config["hessian_escape_enabled"] = False
+    placer._config["orfs_guard_repair_enabled"] = False
+    placer._config["orfs_spacing_polish_enabled"] = False
+    selected = placer.place(FakeBenchmark())
+
+    assert float(selected[0, 0]) == 3.0
+    assert placer._last_run_stats["sa_generator_candidates"] == 1
+    assert placer._last_run_stats["sa_generator_best_proxy"] == pytest.approx(0.3)
+    candidate_summary = placer._last_run_stats["candidate_summary"]
+    assert candidate_summary["best_by_source"]["sa_generator"]["proxy_cost"] == pytest.approx(3.0)
+    assert candidate_summary["best_by_source"]["initial_guard"]["proxy_cost"] == pytest.approx(9.0)
+
+
+@pytest.mark.unit
+def test_sa_rotation_candidate_source_competes_with_base_sa(monkeypatch) -> None:
+    from macro_place.sa_generator import AnnealCandidate
+    from submissions.macro_placer import cd_lns_placer
+    from submissions.macro_placer.cd_lns_placer import CDLNSPlacer
+
+    class FakeBenchmark:
+        name = "fake"
+        canvas_width = 10.0
+        canvas_height = 10.0
+
+    class FakeOrientationState:
+        macro_orientation = np.asarray([0, 0, 0], dtype=np.int8)
+
+    seen_probs: list[float] = []
+
+    def fake_generate_sa_candidates(**kwargs: object) -> list[AnnealCandidate]:
+        probability = float(kwargs["rotation_probability"])
+        seen_probs.append(probability)
+        marker = 2.0 if probability > 0.0 else 4.0
+        return [
+            AnnealCandidate(
+                positions=_marker_positions(marker),
+                proxy_cost=marker,
+                objective=marker,
+                overlap_count=0,
+                evaluations=12,
+                accepted_moves=5,
+            )
+        ]
+
+    def fake_score(
+        pos_t: torch.Tensor, benchmark: object, plc: object
+    ) -> dict[str, float | int]:
+        marker = float(pos_t[0, 0])
+        return {"overlap_count": 0, "proxy_cost": marker}
+
+    monkeypatch.setattr(cd_lns_placer, "resolve_plc", lambda benchmark: object())
+    monkeypatch.setattr(
+        cd_lns_placer, "build_fast_proxy_context", lambda plc, benchmark: object()
+    )
+    monkeypatch.setattr(
+        cd_lns_placer, "build_orientation_state",
+        lambda ctx, plc, benchmark: FakeOrientationState(),
+    )
+    monkeypatch.setattr(
+        CDLNSPlacer,
+        "_initial_positions",
+        lambda self, benchmark, plc: _marker_positions(9.0),
+    )
+    monkeypatch.setattr(
+        cd_lns_placer, "generate_sa_candidates", fake_generate_sa_candidates
+    )
+    monkeypatch.setattr(cd_lns_placer, "repair_overlaps", lambda pos_t, benchmark: pos_t)
+    monkeypatch.setattr(cd_lns_placer, "compute_proxy_cost", fake_score)
+
+    placer = CDLNSPlacer()
+    placer._config["num_restarts"] = 0
+    placer._config["sa_generator_enabled"] = True
+    placer._config["sa_rotation_extra_source_enabled"] = True
+    placer._config["sa_rotation_extra_source_probability"] = 0.1
+    placer._config["topk_polish_enabled"] = False
+    placer._config["hessian_escape_enabled"] = False
+    placer._config["orfs_guard_repair_enabled"] = False
+    placer._config["orfs_spacing_polish_enabled"] = False
+    selected = placer.place(FakeBenchmark())
+
+    assert seen_probs == [0.0, 0.1]
+    assert float(selected[0, 0]) == 2.0
+    assert placer._last_run_stats["sa_generator_candidates"] == 2
+    candidate_summary = placer._last_run_stats["candidate_summary"]
+    assert candidate_summary["best_by_source"]["sa_generator"]["proxy_cost"] == pytest.approx(4.0)
+    assert candidate_summary["best_by_source"]["sa_generator_rotation"]["proxy_cost"] == pytest.approx(2.0)
+
+
+@pytest.mark.unit
+def test_targeted_sa_escape_runs_from_current_proxy_best(monkeypatch) -> None:
+    from macro_place.sa_generator import AnnealCandidate
+    from submissions.macro_placer import cd_lns_placer
+    from submissions.macro_placer.cd_lns_placer import CDLNSPlacer
+
+    class FakeBenchmark:
+        name = "fake"
+        canvas_width = 10.0
+        canvas_height = 10.0
+
+    captured: dict[str, float] = {}
+
+    def fake_targeted_sa(**kwargs: object) -> list[AnnealCandidate]:
+        initial_positions = np.asarray(kwargs["initial_positions"], dtype=np.float64)
+        captured["source_marker"] = float(initial_positions[0, 0])
+        return [
+            AnnealCandidate(
+                positions=_marker_positions(0.5),
+                proxy_cost=0.5,
+                objective=0.5,
+                overlap_count=0,
+                evaluations=7,
+                accepted_moves=3,
+            )
+        ]
+
+    def fake_score(
+        pos_t: torch.Tensor, benchmark: object, plc: object
+    ) -> dict[str, float | int]:
+        marker = float(pos_t[0, 0])
+        return {"overlap_count": 0, "proxy_cost": marker}
+
+    monkeypatch.setattr(cd_lns_placer, "resolve_plc", lambda benchmark: object())
+    monkeypatch.setattr(cd_lns_placer, "build_fast_proxy_context", lambda plc, benchmark: object())
+    monkeypatch.setattr(CDLNSPlacer, "_initial_positions", lambda self, benchmark, plc: _marker_positions(9.0))
+    monkeypatch.setattr(CDLNSPlacer, "_run_one_restart", lambda *args, **kwargs: (_marker_positions(1.0), 1.0))
+    monkeypatch.setattr(cd_lns_placer, "generate_targeted_sa_escape_candidates", fake_targeted_sa)
+    monkeypatch.setattr(cd_lns_placer, "repair_overlaps", lambda pos_t, benchmark: pos_t)
+    monkeypatch.setattr(cd_lns_placer, "compute_proxy_cost", fake_score)
+
+    placer = CDLNSPlacer()
+    placer._config["num_restarts"] = 1
+    placer._config["sa_generator_enabled"] = False
+    placer._config["targeted_sa_escape_enabled"] = True
+    placer._config["topk_polish_enabled"] = False
+    placer._config["hessian_escape_enabled"] = False
+    placer._config["orfs_guard_repair_enabled"] = False
+    placer._config["orfs_spacing_polish_enabled"] = False
+    selected = placer.place(FakeBenchmark())
+
+    assert captured["source_marker"] == pytest.approx(1.0)
+    assert float(selected[0, 0]) == pytest.approx(0.5)
+    assert placer._last_run_stats["targeted_sa_escape_candidates"] == 1
+    assert placer._last_run_stats["candidate_summary"]["best_by_source"][
+        "targeted_sa_escape"
+    ]["proxy_cost"] == pytest.approx(0.5)
 
 
 @pytest.mark.unit
@@ -456,6 +666,8 @@ def test_orfs_spacing_polish_candidate_repairs_core_clamp_sliver(
     assert metrics["post_clamp_overlap_count"] == 0
     assert metrics["post_clamp_min_clearance_um"] >= 2.0 - 1e-6
     assert polished.stats["candidate_kind"] == "orfs_spacing_polish"
+    assert polished.key == (0, polished.cost["proxy_cost"])
+    assert polished.key == polished.stats["polished_proxy_key"]
 
 
 @pytest.mark.unit

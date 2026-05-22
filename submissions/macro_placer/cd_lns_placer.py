@@ -69,8 +69,13 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "lns_min_time_budget_s": 5.0,
     "warm_start_sigma": 0.05,
     "restart_modes": ("conservative", "light", "aggressive", "aggressive"),
-    # Experimental basin generator. Disabled until a smoke/full-budget probe
-    # proves it beats the D-enabled CD/LNS baseline under equal work.
+    # Guarded basin generator. Its candidates compete with CD/LNS outputs and
+    # only affect the final answer when downstream scoring selects them.
+    # Disabled for submission: partial 11-bench full IBM run showed +0.49% mean
+    # regression vs v1.1. Broad-SA candidates were not strictly additive — they
+    # consumed top-K polish budget and pushed v1.1's CD/LNS winners off the
+    # podium on enough benches to be a net loss. Keep off until a true
+    # "no-worse" gate is in place.
     "sa_generator_enabled": False,
     "sa_generator_steps": 1_000,
     "sa_generator_num_candidates": 4,
@@ -241,6 +246,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # is > 0). Default 0.0 is bit-exact identical to the prior path.
     "lns_rotation_probability": 0.0,
     "sa_rotation_probability": 0.0,
+    # Conservative Step F source: keep base SA unchanged, then add a separate
+    # rotation-enabled SA pool. Final candidate scoring accepts it only if it wins.
+    # Disabled for submission alongside sa_generator_enabled — same regression
+    # signal. Keep off until proven non-regressing across the full 17-bench set.
+    "sa_rotation_extra_source_enabled": False,
+    "sa_rotation_extra_source_probability": 0.0,
 }
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1098,79 +1109,120 @@ class CDLNSPlacer:
         }
 
         if bool(self._config["sa_generator_enabled"]):
-            # Step F: if sa_rotation_probability > 0, build an orientation
-            # state so the SA inner loop can also propose same-class rotations.
-            # The internal _rescore_archive re-evaluates with the final ctx
-            # pin offsets, so the final orientations are attached to every
-            # candidate to keep the worker's plc state consistent.
-            sa_gen_rot_prob = float(
-                self._config.get("sa_rotation_probability", 0.0)
-            )
-            sa_ori_state = None
-            if sa_gen_rot_prob > 0.0:
+            def _build_sa_orientation_state() -> Any | None:
                 try:
-                    sa_ori_state = build_orientation_state(ctx, plc, benchmark)
+                    return build_orientation_state(ctx, plc, benchmark)
                 except Exception:
-                    sa_ori_state = None
-                    sa_gen_rot_prob = 0.0
-            sa_candidates = generate_sa_candidates(
-                initial_positions=initial_pos,
-                ctx=ctx,
-                canvas_w=float(benchmark.canvas_width),
-                canvas_h=float(benchmark.canvas_height),
-                seed=int(self._config["sa_generator_seed"]),
-                steps=int(self._config["sa_generator_steps"]),
-                num_candidates=int(self._config["sa_generator_num_candidates"]),
-                initial_temperature_ratio=float(
-                    self._config["sa_generator_initial_temperature_ratio"]
-                ),
-                final_temperature_ratio=float(
-                    self._config["sa_generator_final_temperature_ratio"]
-                ),
-                global_move_probability=float(
-                    self._config["sa_generator_global_move_probability"]
-                ),
-                overlap_penalty=float(self._config["sa_generator_overlap_penalty"]),
-                diversity_distance_ratio=float(
-                    self._config["sa_generator_diversity_distance_ratio"]
-                ),
-                exact_rescore_pool_size=int(
-                    self._config["sa_generator_exact_rescore_pool_size"]
-                ),
-                pre_legalize_iters=int(
-                    self._config["sa_generator_pre_legalize_iters"]
-                ),
-                orientation_state=sa_ori_state,
-                rotation_probability=sa_gen_rot_prob,
-            )
-            sa_candidate_orientations: np.ndarray | None = None
-            if sa_ori_state is not None and sa_gen_rot_prob > 0.0:
-                sa_candidate_orientations = np.asarray(
-                    sa_ori_state.macro_orientation, dtype=np.int8
-                ).copy()
-            for candidate_idx, candidate in enumerate(sa_candidates):
-                results.append(
-                    (
-                        candidate.positions,
-                        float(candidate.proxy_cost),
-                        {
-                            "restart_idx": -2,
-                            "mode": "sa_generator",
-                            "candidate_kind": "sa_generator",
-                            "candidate_idx": int(candidate_idx),
-                            "sa_objective": float(candidate.objective),
-                            "sa_proxy_cost": float(candidate.proxy_cost),
-                            "sa_overlap_count": int(candidate.overlap_count),
-                            "sa_evaluations": int(candidate.evaluations),
-                            "sa_accepted_moves": int(candidate.accepted_moves),
-                        },
-                        sa_candidate_orientations,
-                    )
+                    return None
+
+            def _generate_sa_source(
+                *,
+                source: str,
+                restart_idx: int,
+                rotation_probability: float,
+                seed_offset: int,
+                require_rotation: bool = False,
+            ) -> list[Any]:
+                orientation_state = None
+                rot_prob = float(rotation_probability)
+                if rot_prob > 0.0:
+                    orientation_state = _build_sa_orientation_state()
+                    if orientation_state is None:
+                        if require_rotation:
+                            return []
+                        rot_prob = 0.0
+                candidates = generate_sa_candidates(
+                    initial_positions=initial_pos,
+                    ctx=ctx,
+                    canvas_w=float(benchmark.canvas_width),
+                    canvas_h=float(benchmark.canvas_height),
+                    seed=int(self._config["sa_generator_seed"]) + int(seed_offset),
+                    steps=int(self._config["sa_generator_steps"]),
+                    num_candidates=int(self._config["sa_generator_num_candidates"]),
+                    initial_temperature_ratio=float(
+                        self._config["sa_generator_initial_temperature_ratio"]
+                    ),
+                    final_temperature_ratio=float(
+                        self._config["sa_generator_final_temperature_ratio"]
+                    ),
+                    global_move_probability=float(
+                        self._config["sa_generator_global_move_probability"]
+                    ),
+                    overlap_penalty=float(self._config["sa_generator_overlap_penalty"]),
+                    diversity_distance_ratio=float(
+                        self._config["sa_generator_diversity_distance_ratio"]
+                    ),
+                    exact_rescore_pool_size=int(
+                        self._config["sa_generator_exact_rescore_pool_size"]
+                    ),
+                    pre_legalize_iters=int(
+                        self._config["sa_generator_pre_legalize_iters"]
+                    ),
+                    orientation_state=orientation_state,
+                    rotation_probability=rot_prob,
                 )
-            self._last_run_stats["sa_generator_candidates"] = int(len(sa_candidates))
-            if sa_candidates:
+                candidate_orientations: np.ndarray | None = None
+                if orientation_state is not None and rot_prob > 0.0:
+                    candidate_orientations = np.asarray(
+                        orientation_state.macro_orientation, dtype=np.int8
+                    ).copy()
+                for candidate_idx, candidate in enumerate(candidates):
+                    results.append(
+                        (
+                            candidate.positions,
+                            float(candidate.proxy_cost),
+                            {
+                                "restart_idx": int(restart_idx),
+                                "mode": source,
+                                "candidate_kind": source,
+                                "candidate_idx": int(candidate_idx),
+                                "sa_objective": float(candidate.objective),
+                                "sa_proxy_cost": float(candidate.proxy_cost),
+                                "sa_overlap_count": int(candidate.overlap_count),
+                                "sa_evaluations": int(candidate.evaluations),
+                                "sa_accepted_moves": int(candidate.accepted_moves),
+                                "sa_rotation_probability": float(rot_prob),
+                            },
+                            candidate_orientations,
+                        )
+                    )
+                return candidates
+
+            sa_candidates = _generate_sa_source(
+                source="sa_generator",
+                restart_idx=-2,
+                rotation_probability=float(
+                    self._config.get("sa_rotation_probability", 0.0)
+                ),
+                seed_offset=0,
+            )
+            rotation_candidates: list[Any] = []
+            extra_prob = float(
+                self._config.get("sa_rotation_extra_source_probability", 0.0)
+            )
+            if (
+                bool(self._config.get("sa_rotation_extra_source_enabled", False))
+                and extra_prob > 0.0
+                and extra_prob
+                != float(self._config.get("sa_rotation_probability", 0.0))
+            ):
+                rotation_candidates = _generate_sa_source(
+                    source="sa_generator_rotation",
+                    restart_idx=-3,
+                    rotation_probability=extra_prob,
+                    seed_offset=1_000_000,
+                    require_rotation=True,
+                )
+            all_sa_candidates = [*sa_candidates, *rotation_candidates]
+            self._last_run_stats["sa_generator_candidates"] = int(
+                len(all_sa_candidates)
+            )
+            self._last_run_stats["sa_generator_rotation_candidates"] = int(
+                len(rotation_candidates)
+            )
+            if all_sa_candidates:
                 self._last_run_stats["sa_generator_best_proxy"] = float(
-                    min(candidate.proxy_cost for candidate in sa_candidates)
+                    min(candidate.proxy_cost for candidate in all_sa_candidates)
                 )
 
         if num_restarts >= 1:
