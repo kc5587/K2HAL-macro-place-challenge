@@ -852,6 +852,79 @@ def fast_congestion(positions: np.ndarray, ctx: FastProxyContext) -> float:
     return float(top_vals.mean())
 
 
+def fast_congestion_per_bin(
+    positions: np.ndarray, ctx: FastProxyContext
+) -> np.ndarray:
+    """Per-bin routing demand as a [grid_row, grid_col] grid.
+
+    Uses the same kernels as ``fast_congestion`` (net routing + smoothing +
+    macro blockage) but returns the per-cell demand BEFORE the top-5% abu
+    reduction. Each cell's value is ``(V_cong + V_macro) + (H_cong + H_macro)``
+    after capacity normalization and V-smoothing of wire routes — i.e., the
+    same numbers the abu reduction operates on, summed by direction so a
+    single scalar per bin ranks "how congested is this bin".
+
+    Used by Lever L (worst-congestion-bin destroy).
+    """
+    import math
+
+    grid_col = ctx.grid_col
+    grid_row = ctx.grid_row
+    cell_w = ctx.canvas_w / grid_col
+    cell_h = ctx.canvas_h / grid_row
+
+    grid_v_routes = cell_w * ctx.v_routes_per_micron
+    grid_h_routes = cell_h * ctx.h_routes_per_micron
+
+    n_cells = grid_row * grid_col
+    H_cong = np.zeros(n_cells, dtype=np.float64)
+    V_cong = np.zeros(n_cells, dtype=np.float64)
+    H_macro = np.zeros(n_cells, dtype=np.float64)
+    V_macro = np.zeros(n_cells, dtype=np.float64)
+
+    macro_idx = ctx.pin_macro_idx
+    px = ctx.pin_offset_x.astype(np.float64)
+    py = ctx.pin_offset_y.astype(np.float64)
+    movable = macro_idx >= 0
+    if movable.any():
+        valid_idx = macro_idx[movable]
+        px[movable] += positions[valid_idx, 0].astype(np.float64)
+        py[movable] += positions[valid_idx, 1].astype(np.float64)
+
+    _congestion_net_routing_kernel(
+        px, py, ctx.net_pin_starts, ctx.net_pin_indices, ctx.net_weights,
+        ctx.net_source_pin_local, grid_row, grid_col, cell_w, cell_h,
+        H_cong, V_cong,
+    )
+    if grid_v_routes > 0.0:
+        V_cong /= grid_v_routes
+    if grid_h_routes > 0.0:
+        H_cong /= grid_h_routes
+
+    _smooth_v(V_cong, grid_row, grid_col, ctx.smooth_range)
+    _smooth_h(H_cong, grid_row, grid_col, ctx.smooth_range)
+
+    num_hard = int(ctx.macro_is_hard.sum())
+    if num_hard > 0:
+        pos_x = positions[:num_hard, 0].astype(np.float64)
+        pos_y = positions[:num_hard, 1].astype(np.float64)
+        mw_f64 = ctx.macro_w[:num_hard].astype(np.float64)
+        mh_f64 = ctx.macro_h[:num_hard].astype(np.float64)
+        _macro_blockage_all_kernel(
+            pos_x, pos_y, mw_f64, mh_f64, num_hard,
+            grid_row, grid_col, cell_w, cell_h,
+            float(ctx.hrouting_alloc), float(ctx.vrouting_alloc),
+            H_macro, V_macro,
+        )
+    if grid_v_routes > 0.0:
+        V_macro /= grid_v_routes
+    if grid_h_routes > 0.0:
+        H_macro /= grid_h_routes
+
+    per_bin = (V_cong + V_macro) + (H_cong + H_macro)
+    return per_bin.reshape(grid_row, grid_col)
+
+
 def _two_pin_route(
     node_gcells: list[tuple[int, int]],
     source_gcell: tuple[int, int],

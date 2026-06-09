@@ -10,11 +10,18 @@ used only for final validation in the placer entry.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 
 from macro_place.fast_proxy import FastProxyContext, fast_proxy
+from macro_place.fast_proxy_incremental import (
+    FastProxyCache,
+    apply_move,
+    build_cache,
+    cache_result,
+    revert_move,
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +38,11 @@ def cd_grid_search(
     ctx: FastProxyContext,
     radius: float,
     k_per_axis: int = 8,
+    cache: FastProxyCache | None = None,
+    tiebreak_enabled: bool = False,
+    tie_epsilon_rel: float = 1e-3,
+    orientation_state: Any | None = None,
+    search_orientations: bool = False,
 ) -> Tuple[np.ndarray, float]:
     """Grid-search the best position for one node, holding others fixed.
 
@@ -59,20 +71,87 @@ def cd_grid_search(
     grid_x = np.clip(cx + offsets, 0.0, ctx.canvas_w)
     grid_y = np.clip(cy + offsets, 0.0, ctx.canvas_h)
 
-    work = positions.copy()
     best_pos = np.array([cx, cy], dtype=np.float64)
-    best_cost = float(fast_proxy(positions, ctx).proxy_cost)
+    owned_cache = cache is None
+    if cache is None:
+        cache = build_cache(positions, ctx)
+    base_cost = float(cache_result(cache).proxy_cost)
+    base_congestion = float(cache_result(cache).congestion)
+    best_cost = base_cost
+    best_congestion = base_congestion
+    old_xy = np.array([cx, cy], dtype=np.float64)
 
-    for gy in grid_y:
-        for gx in grid_x:
-            work[node_idx, 0] = gx
-            work[node_idx, 1] = gy
-            cost = float(fast_proxy(work, ctx).proxy_cost)
-            if cost < best_cost:
-                best_cost = cost
-                best_pos = np.array([gx, gy], dtype=np.float64)
+    # Lever C — orientation search outer loop. Default behavior (None state
+    # or search_orientations=False) keeps the original single-orientation
+    # search. With both provided, iterate the macro's same-class orientations.
+    do_ori_search = bool(search_orientations) and orientation_state is not None
+    if do_ori_search:
+        from macro_place.orientation import orientation_class_indices
+        from macro_place.orientation_cache import apply_rotation_to_cache
+
+        cur_ori = int(orientation_state.macro_orientation[node_idx])
+        orientations_to_try: Tuple[int, ...] = tuple(
+            orientation_class_indices(cur_ori)
+        )
+    else:
+        cur_ori = 0  # unused
+        orientations_to_try = (0,)
+    best_ori = cur_ori
+
+    for ori_idx in orientations_to_try:
+        if do_ori_search and ori_idx != int(orientation_state.macro_orientation[node_idx]):
+            # Switch orientation: mutates ctx.pin_offset_x/y + cache HPWL.
+            apply_rotation_to_cache(cache, ctx, orientation_state, node_idx, ori_idx)
+        # Re-read base cost for tiebreak comparison at this orientation.
+        # (Not used for "best" tracking — that uses the original base_cost so
+        # all orientations compete fairly on absolute proxy.)
+        for gy in grid_y:
+            for gx in grid_x:
+                result = apply_move(
+                    cache,
+                    ctx,
+                    node_idx,
+                    np.array([gx, gy], dtype=np.float64),
+                    exact_hpwl=owned_cache,
+                )
+                cost = float(result.proxy_cost)
+                congestion = float(result.congestion)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_congestion = congestion
+                    best_pos = np.array([gx, gy], dtype=np.float64)
+                    if do_ori_search:
+                        best_ori = ori_idx
+                elif (
+                    bool(tiebreak_enabled)
+                    and best_cost + 1e-9 < base_cost
+                    and _relative_diff(cost, best_cost) <= max(0.0, float(tie_epsilon_rel))
+                    and congestion + 1e-9 < best_congestion
+                ):
+                    best_cost = cost
+                    best_congestion = congestion
+                    best_pos = np.array([gx, gy], dtype=np.float64)
+                    if do_ori_search:
+                        best_ori = ori_idx
+                revert_move(cache, ctx, node_idx, old_xy)
+
+    # Restore orientation to initial before applying the winner (or for owned_cache).
+    if do_ori_search:
+        cur_state_ori = int(orientation_state.macro_orientation[node_idx])
+        if cur_state_ori != cur_ori:
+            apply_rotation_to_cache(cache, ctx, orientation_state, node_idx, cur_ori)
+
+    if not owned_cache and best_cost + 1e-9 < base_cost:
+        # Apply winning orientation (if changed) before the move.
+        if do_ori_search and best_ori != cur_ori:
+            apply_rotation_to_cache(cache, ctx, orientation_state, node_idx, best_ori)
+        apply_move(cache, ctx, node_idx, best_pos, exact_hpwl=False)
 
     return best_pos, best_cost
+
+
+def _relative_diff(candidate_cost: float, best_cost: float) -> float:
+    return (float(candidate_cost) - float(best_cost)) / max(abs(float(best_cost)), 1e-12)
 
 
 def cd_sweep(
@@ -81,6 +160,12 @@ def cd_sweep(
     radius: float,
     k_per_axis: int = 8,
     seed: int = 0,
+    cache: FastProxyCache | None = None,
+    freeze_mask: np.ndarray | None = None,
+    tiebreak_enabled: bool = False,
+    tie_epsilon_rel: float = 1e-3,
+    orientation_state: Any | None = None,
+    search_orientations: bool = False,
 ) -> Tuple[np.ndarray, bool, int]:
     """One full coordinate-descent sweep over all nodes.
 
@@ -96,6 +181,9 @@ def cd_sweep(
         radius: half-width of the candidate window per node.
         k_per_axis: candidates per axis (total per node = ``k_per_axis ** 2``).
         seed: RNG seed for the sweep order.
+        freeze_mask: optional bool array shape ``[num_nodes]``. Macros where
+            ``freeze_mask[i]`` is True are skipped in the sweep — used by
+            Lever M (big-macro-first / two-stage placement).
 
     Returns:
         (new_positions, improved, num_evals)
@@ -107,10 +195,20 @@ def cd_sweep(
     n_nodes = work.shape[0]
     rng = np.random.default_rng(seed)
     order = rng.permutation(n_nodes)
+    if freeze_mask is not None:
+        frozen = np.asarray(freeze_mask, dtype=bool)
+        if frozen.shape != (n_nodes,):
+            raise ValueError(
+                f"freeze_mask shape {frozen.shape} != ({n_nodes},)"
+            )
+        order = order[~frozen[order]]
 
     improved = False
     num_evals = 0
-    current_cost = float(fast_proxy(work, ctx).proxy_cost)
+    owned_cache = cache is None
+    if cache is None:
+        cache = build_cache(work, ctx)
+    current_cost = float(cache_result(cache).proxy_cost)
     num_evals += 1
 
     for idx in order:
@@ -121,6 +219,11 @@ def cd_sweep(
             ctx=ctx,
             radius=radius,
             k_per_axis=k_per_axis,
+            cache=cache,
+            tiebreak_enabled=tiebreak_enabled,
+            tie_epsilon_rel=tie_epsilon_rel,
+            orientation_state=orientation_state,
+            search_orientations=search_orientations,
         )
         # cd_grid_search itself runs k_per_axis**2 + 1 evaluations
         num_evals += k_per_axis * k_per_axis + 1
@@ -129,6 +232,16 @@ def cd_sweep(
             work[node_idx, 1] = best_pos[1]
             current_cost = best_cost
             improved = True
+
+    final = fast_proxy(work, ctx)
+    cache.total_hpwl = float(final.wirelength)
+    cache.total_density = float(final.density)
+    cache.total_congestion = float(final.congestion)
+    cache.total_overlap_count = int(final.overlap_count)
+    if owned_cache:
+        # Keep the local cache alive through the sweep for speed, but callers
+        # that did not pass it do not observe it.
+        del cache
 
     return work, improved, num_evals
 
@@ -156,6 +269,11 @@ def cd_loop(
     radius_min_ratio: float = 1.0 / 64.0,
     time_budget_s: float = 60.0,
     seed: int = 0,
+    freeze_mask: np.ndarray | None = None,
+    tiebreak_enabled: bool = False,
+    tie_epsilon_rel: float = 1e-3,
+    orientation_state: Any | None = None,
+    search_orientations: bool = False,
 ) -> CDResult:
     """Run coordinate-descent sweeps with shrinking search radius.
 
@@ -190,6 +308,11 @@ def cd_loop(
             radius=radius,
             k_per_axis=k_per_axis,
             seed=seed + sweep_idx,
+            freeze_mask=freeze_mask,
+            tiebreak_enabled=tiebreak_enabled,
+            tie_epsilon_rel=tie_epsilon_rel,
+            orientation_state=orientation_state,
+            search_orientations=search_orientations,
         )
         total_evals += evals
         sweeps_completed += 1

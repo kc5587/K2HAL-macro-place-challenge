@@ -32,6 +32,58 @@ _NG45_MAP = {
 }
 
 
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    """Return paths in order with duplicates removed."""
+    seen: set[str] = set()
+    deduped: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _candidate_roots() -> list[Path]:
+    """
+    Candidate repository roots that may hold benchmark data.
+
+    The public swag self-contained harness imports our package from
+    /submission but runs from /challenge, where external/MacroPlacement lives.
+    """
+    return _dedupe_paths(
+        [
+            _REPO_ROOT,
+            Path.cwd(),
+            Path("/challenge"),
+            Path("/submission"),
+        ]
+    )
+
+
+def _ibm_roots() -> list[Path]:
+    roots = [
+        _IBM_ROOT,
+        *[
+            root / "external" / "MacroPlacement" / "Testcases" / "ICCAD04"
+            for root in _candidate_roots()
+        ],
+    ]
+    return _dedupe_paths(roots)
+
+
+def _ng45_roots() -> list[Path]:
+    roots = [
+        _NG45_ROOT,
+        *[
+            root / "external" / "MacroPlacement" / "Flows" / "NanGate45"
+            for root in _candidate_roots()
+        ],
+    ]
+    return _dedupe_paths(roots)
+
+
 def _find_benchmark_dir(benchmark: Benchmark) -> Optional[Path]:
     """
     Discover the on-disk directory for a benchmark.
@@ -44,20 +96,24 @@ def _find_benchmark_dir(benchmark: Benchmark) -> Optional[Path]:
         Path to benchmark directory, or None if not found.
     """
     # Strategy 1: IBM by name
-    ibm_dir = _IBM_ROOT / benchmark.name
-    if ibm_dir.exists() and (ibm_dir / "netlist.pb.txt").exists():
-        return ibm_dir
+    for ibm_root in _ibm_roots():
+        ibm_dir = ibm_root / benchmark.name
+        if ibm_dir.exists() and (ibm_dir / "netlist.pb.txt").exists():
+            return ibm_dir
 
     # Strategy 2: NG45 by name/alias
     ng45_name = _NG45_MAP.get(benchmark.name)
     if ng45_name:
-        ng45_dir = _NG45_ROOT / ng45_name / "netlist" / "output_CT_Grouping"
-        if ng45_dir.exists() and (ng45_dir / "netlist.pb.txt").exists():
-            return ng45_dir
+        for ng45_root in _ng45_roots():
+            ng45_dir = ng45_root / ng45_name / "netlist" / "output_CT_Grouping"
+            if ng45_dir.exists() and (ng45_dir / "netlist.pb.txt").exists():
+                return ng45_dir
 
     # Strategy 3: NG45 fallback -- match by canvas dimensions + macro count
-    if _NG45_ROOT.exists():
-        for design_dir in sorted(_NG45_ROOT.iterdir()):
+    for ng45_root in _ng45_roots():
+        if not ng45_root.exists():
+            continue
+        for design_dir in sorted(ng45_root.iterdir()):
             if not design_dir.is_dir():
                 continue
             candidate = design_dir / "netlist" / "output_CT_Grouping"
